@@ -164,35 +164,20 @@ For example, the configuration file in [conf/nutcracker.yml](conf/nutcracker.yml
        - 127.0.0.1:11215:1
 
     lambda:
-      # listening port
+	  # example of range distribution
+	  # see comments in nutcracker.yml
       listen: 127.0.0.1:22125
-      # redis backend ?
       redis: true
-      # balance hash
       hash: fnv1a_64
-      # balance mode
       distribution: range
-      # preconnect ?
       preconnect: true
-      # timeout ms
       timeout: 5
-      # auto eject failed server ?
       auto_eject_hosts: true
       server_failure_limit: 3
       server_retry_timeout: 2000
-      # rate-limiting average: 10000 req/s
       rate: 100000
-      # rate-limiting burst: 20000 req/s
       burst: 200000
-      # read_mode:（valid for range only）
-      #  0: all
-      #  1: read slave first
-      #  2: read master only
       read_mode: 0
-      # backend servers
-      #  m: master
-      #  s: slave
-      #  range: [0, 65536)
       servers:
        - m:127.0.0.1:11211:1 server1 0-32768
        - s:127.0.0.1:11212:1 server2 0-32768
