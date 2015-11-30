@@ -2,6 +2,8 @@
 
 **twemproxy** (pronounced "two-em-proxy"), aka **nutcracker** is a fast and lightweight proxy for [memcached](http://www.memcached.org/) and [redis](http://redis.io/) protocol. It was primarily built to reduce the connection count on the backend caching servers.
 
+This is a modified version for test and some usage.
+
 ## Build
 
 To build nutcracker from [distribution tarball](http://code.google.com/p/twemproxy/downloads/list):
