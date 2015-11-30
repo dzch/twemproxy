@@ -22,11 +22,11 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/utsname.h>
 
 #include <nc_core.h>
 #include <nc_conf.h>
 #include <nc_signal.h>
+#include <nc_release.h>
 
 #define NC_CONF_PATH        "conf/nutcracker.yml"
 
@@ -175,17 +175,7 @@ nc_daemonize(int dump_core)
 static void
 nc_print_run(struct instance *nci)
 {
-    int status;
-    struct utsname name;
-
-    status = uname(&name);
-    if (status < 0) {
-        loga("nutcracker-%s started on pid %d", NC_VERSION_STRING, nci->pid);
-    } else {
-        loga("nutcracker-%s built for %s %s %s started on pid %d",
-             NC_VERSION_STRING, name.sysname, name.release, name.machine,
-             nci->pid);
-    }
+    loga("nutcracker-%s started on pid %d", NC_VERSION_STRING, nci->pid);
 
     loga("run, rabbit run / dig that hole, forget the sun / "
          "and when at last the work is done / don't sit down / "
@@ -214,7 +204,7 @@ nc_show_usage(void)
         "  -d, --daemonize        : run as a daemon" CRLF
         "  -D, --describe-stats   : print stats description and exit");
     log_stderr(
-        "  -v, --verbose=N        : set logging level (default: %d, min: %d, max: %d)" CRLF
+        "  -v, --verbosity=N      : set logging level (default: %d, min: %d, max: %d)" CRLF
         "  -o, --output=S         : set logging file (default: %s)" CRLF
         "  -c, --conf-file=S      : set configuration file (default: %s)" CRLF
         "  -s, --stats-port=N     : set stats monitoring port (default: %d)" CRLF
@@ -229,6 +219,13 @@ nc_show_usage(void)
         NC_STATS_PORT, NC_STATS_ADDR, NC_STATS_INTERVAL,
         NC_PID_FILE != NULL ? NC_PID_FILE : "off",
         NC_MBUF_SIZE);
+}
+
+static void
+nc_show_version()
+{
+    log_stderr("This is nutcracker-%s sha=%s:%d" CRLF, 
+               NC_VERSION_STRING, NC_GIT_SHA1, strtol(NC_GIT_DIRTY, NULL, 10) > 0);    
 }
 
 static rstatus_t
@@ -318,7 +315,6 @@ nc_get_options(int argc, char **argv, struct instance *nci)
 
         switch (c) {
         case 'h':
-            show_version = 1;
             show_help = 1;
             break;
 
@@ -336,7 +332,6 @@ nc_get_options(int argc, char **argv, struct instance *nci)
 
         case 'D':
             describe_stats = 1;
-            show_version = 1;
             break;
 
         case 'v':
@@ -551,15 +546,17 @@ main(int argc, char **argv)
     }
 
     if (show_version) {
-        log_stderr("This is nutcracker-%s" CRLF, NC_VERSION_STRING);
-        if (show_help) {
-            nc_show_usage();
-        }
+        nc_show_version();
+        exit(0);
+    }
 
-        if (describe_stats) {
-            stats_describe();
-        }
+    if (show_help) {
+        nc_show_usage();
+        exit(0);
+    }
 
+    if (describe_stats) {
+        stats_describe();
         exit(0);
     }
 

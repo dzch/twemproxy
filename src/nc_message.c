@@ -116,13 +116,6 @@ static struct msg_tqh free_msgq; /* free msg q */
 static struct rbtree tmo_rbt;    /* timeout rbtree */
 static struct rbnode tmo_rbs;    /* timeout rbtree sentinel */
 
-#define DEFINE_ACTION(_name) string(#_name),
-static struct string msg_type_strings[] = {
-    MSG_TYPE_CODEC( DEFINE_ACTION )
-    null_string
-};
-#undef DEFINE_ACTION
-
 static struct msg *
 msg_from_rbe(struct rbnode *node)
 {
@@ -193,6 +186,7 @@ msg_tmo_delete(struct msg *msg)
 static struct msg *
 _msg_get(void)
 {
+    rstatus_t status;
     struct msg *msg;
 
     if (!TAILQ_EMPTY(&free_msgq)) {
@@ -209,46 +203,51 @@ _msg_get(void)
         return NULL;
     }
 
+    status = array_init(&msg->keys, DEFAULT_STATS_NUM, sizeof(struct string));
+    if (status != NC_OK) {
+        return NULL;
+    }
+    status = array_init(&msg->vals, DEFAULT_STATS_NUM, sizeof(struct string));
+    if (status != NC_OK) {
+        return NULL;
+    }
 done:
     /* c_tqe, s_tqe, and m_tqe are left uninitialized */
     msg->id = ++msg_id;
     msg->peer = NULL;
     msg->owner = NULL;
+    msg->origin = NULL;
 
     rbtree_node_init(&msg->tmo_rbe);
 
     STAILQ_INIT(&msg->mhdr);
     msg->mlen = 0;
-    msg->start_ts = 0;
 
     msg->state = 0;
     msg->pos = NULL;
     msg->token = NULL;
 
     msg->parser = NULL;
-    msg->add_auth = NULL;
     msg->result = MSG_PARSE_OK;
 
-    msg->fragment = NULL;
-    msg->reply = NULL;
+    msg->pre_splitcopy = NULL;
+    msg->post_splitcopy = NULL;
     msg->pre_coalesce = NULL;
     msg->post_coalesce = NULL;
 
     msg->type = MSG_UNKNOWN;
 
-    msg->keys = array_create(1, sizeof(struct keypos));
-    if (msg->keys == NULL) {
-        nc_free(msg);
-        return NULL;
-    }
-
+    msg->key_start = NULL;
+    msg->key_end = NULL;
+    
+    msg->val_start = NULL;
+    msg->val_end = NULL;
+        
     msg->vlen = 0;
     msg->end = NULL;
 
     msg->frag_owner = NULL;
-    msg->frag_seq = NULL;
     msg->nfrag = 0;
-    msg->nfrag_done = 0;
     msg->frag_id = 0;
 
     msg->narg_start = NULL;
@@ -264,15 +263,22 @@ done:
     msg->request = 0;
     msg->quit = 0;
     msg->noreply = 0;
-    msg->noforward = 0;
     msg->done = 0;
     msg->fdone = 0;
+    msg->first_fragment = 0;
+    msg->last_fragment = 0;
     msg->swallow = 0;
     msg->redis = 0;
+
+    msg->notify_owner = NULL;
+    msg->waiting = 0;
+    msg->pre_swallow = NULL;
+    msg->pre_req_put = NULL;
 
     return msg;
 }
 
+/* conn will be NULL when it's specical purpose message sent from us */
 struct msg *
 msg_get(struct conn *conn, bool request, bool redis)
 {
@@ -293,33 +299,70 @@ msg_get(struct conn *conn, bool request, bool redis)
         } else {
             msg->parser = redis_parse_rsp;
         }
-        msg->add_auth = redis_add_auth;
-        msg->fragment = redis_fragment;
-        msg->reply = redis_reply;
-        msg->failure = redis_failure;
+        msg->pre_splitcopy = redis_pre_splitcopy;
+        msg->post_splitcopy = redis_post_splitcopy;
         msg->pre_coalesce = redis_pre_coalesce;
         msg->post_coalesce = redis_post_coalesce;
+        msg->pre_req_forward = NULL;
+        msg->routing = redis_routing;
+        msg->post_routing = NULL;
+        msg->pre_rsp_forward = redis_pre_rsp_forward;
+        msg->build_probe = redis_build_probe;
     } else {
         if (request) {
             msg->parser = memcache_parse_req;
         } else {
             msg->parser = memcache_parse_rsp;
         }
-        msg->add_auth = memcache_add_auth;
-        msg->fragment = memcache_fragment;
-        msg->failure = memcache_failure;
+        msg->pre_splitcopy = memcache_pre_splitcopy;
+        msg->post_splitcopy = memcache_post_splitcopy;
         msg->pre_coalesce = memcache_pre_coalesce;
         msg->post_coalesce = memcache_post_coalesce;
-    }
-
-    if (log_loggable(LOG_NOTICE) != 0) {
-        msg->start_ts = nc_usec_now();
+        msg->pre_req_forward = memcache_pre_req_forward;
+        msg->routing = memcache_routing;
+        msg->post_routing = memcache_post_routing;
+        msg->pre_rsp_forward = memcache_pre_rsp_forward;
+        msg->build_probe = memcache_build_probe;
     }
 
     log_debug(LOG_VVERB, "get msg %p id %"PRIu64" request %d owner sd %d",
-              msg, msg->id, msg->request, conn->sd);
+              msg, msg->id, msg->request, conn != NULL ? conn->sd : -1);
 
     return msg;
+}
+
+struct msg *
+msg_clone(struct msg *msg)
+{
+    struct msg *clone;
+    struct mbuf *src, *dst;
+    
+    /* Clone message structure */
+    clone = msg_get(msg->owner, msg->request, msg->redis);
+    if (clone == NULL) {
+        return NULL;
+    }
+
+    /* Clone mbufs */
+    STAILQ_FOREACH(src, &msg->mhdr, next) {
+        dst = mbuf_get();
+        if (dst == NULL) {
+            msg_put(clone);
+            return NULL;
+        }
+
+        mbuf_copy(dst, src->pos, mbuf_length(src));
+        mbuf_insert(&clone->mhdr, dst);
+    }
+    
+    clone->type = msg->type;
+    clone->err = msg->err;
+    clone->error = msg->error;
+    clone->noreply = msg->noreply;
+    clone->swallow = msg->swallow;
+    clone->mlen = msg->mlen;
+    
+    return clone;
 }
 
 struct msg *
@@ -328,8 +371,8 @@ msg_get_error(bool redis, err_t err)
     struct msg *msg;
     struct mbuf *mbuf;
     int n;
-    char *errstr = err ? strerror(err) : "unknown";
-    char *protstr = redis ? "-ERR" : "SERVER_ERROR";
+    char *errstr = nc_strerror(err);
+    char *protstr = redis ? "-ERR" : (err > 0) ? "SERVER_ERROR" : "CLIENT_ERROR";
 
     msg = _msg_get();
     if (msg == NULL) {
@@ -345,6 +388,8 @@ msg_get_error(bool redis, err_t err)
         return NULL;
     }
     mbuf_insert(&msg->mhdr, mbuf);
+
+    ASSERT(mbuf_empty(mbuf));
 
     n = nc_scnprintf(mbuf->last, mbuf_size(mbuf), "%s %s"CRLF, protstr, errstr);
     mbuf->last += n;
@@ -362,6 +407,10 @@ msg_free(struct msg *msg)
     ASSERT(STAILQ_EMPTY(&msg->mhdr));
 
     log_debug(LOG_VVERB, "free msg %p id %"PRIu64"", msg, msg->id);
+    
+    array_deinit(&msg->keys);
+    array_deinit(&msg->vals);
+
     nc_free(msg);
 }
 
@@ -375,30 +424,18 @@ msg_put(struct msg *msg)
         mbuf_remove(&msg->mhdr, mbuf);
         mbuf_put(mbuf);
     }
-
-    if (msg->frag_seq) {
-        nc_free(msg->frag_seq);
-        msg->frag_seq = NULL;
-    }
-
-    if (msg->keys) {
-        msg->keys->nelem = 0; /* a hack here */
-        array_destroy(msg->keys);
-        msg->keys = NULL;
-    }
+    
+    array_rewind(&msg->keys);
+    array_rewind(&msg->vals);
 
     nfree_msgq++;
     TAILQ_INSERT_HEAD(&free_msgq, msg, m_tqe);
 }
 
 void
-msg_dump(struct msg *msg, int level)
+msg_dump(struct msg *msg)
 {
     struct mbuf *mbuf;
-
-    if (log_loggable(level) == 0) {
-        return;
-    }
 
     loga("msg dump id %"PRIu64" request %d len %"PRIu32" type %d done %d "
          "error %d (err %d)", msg->id, msg->request, msg->mlen, msg->type,
@@ -412,7 +449,7 @@ msg_dump(struct msg *msg, int level)
         q = mbuf->last;
         len = q - p;
 
-        loga_hexdump(p, len, "mbuf [%p] with %ld bytes of data", p, len);
+        loga_hexdump(p, len, "mbuf with %ld bytes of data", len);
     }
 }
 
@@ -435,137 +472,17 @@ msg_deinit(void)
     for (msg = TAILQ_FIRST(&free_msgq); msg != NULL;
          msg = nmsg, nfree_msgq--) {
         ASSERT(nfree_msgq > 0);
+        
         nmsg = TAILQ_NEXT(msg, m_tqe);
         msg_free(msg);
     }
     ASSERT(nfree_msgq == 0);
 }
 
-struct string *
-msg_type_string(msg_type_t type)
-{
-    return &msg_type_strings[type];
-}
-
 bool
 msg_empty(struct msg *msg)
 {
     return msg->mlen == 0 ? true : false;
-}
-
-uint32_t
-msg_backend_idx(struct msg *msg, uint8_t *key, uint32_t keylen)
-{
-    struct conn *conn = msg->owner;
-    struct server_pool *pool = conn->owner;
-
-    return server_pool_idx(pool, key, keylen);
-}
-
-struct mbuf *
-msg_ensure_mbuf(struct msg *msg, size_t len)
-{
-    struct mbuf *mbuf;
-
-    if (STAILQ_EMPTY(&msg->mhdr) ||
-        mbuf_size(STAILQ_LAST(&msg->mhdr, mbuf, next)) < len) {
-        mbuf = mbuf_get();
-        if (mbuf == NULL) {
-            return NULL;
-        }
-        mbuf_insert(&msg->mhdr, mbuf);
-    } else {
-        mbuf = STAILQ_LAST(&msg->mhdr, mbuf, next);
-    }
-
-    return mbuf;
-}
-
-/*
- * Append n bytes of data, with n <= mbuf_size(mbuf)
- * into mbuf
- */
-rstatus_t
-msg_append(struct msg *msg, uint8_t *pos, size_t n)
-{
-    struct mbuf *mbuf;
-
-    ASSERT(n <= mbuf_data_size());
-
-    mbuf = msg_ensure_mbuf(msg, n);
-    if (mbuf == NULL) {
-        return NC_ENOMEM;
-    }
-
-    ASSERT(n <= mbuf_size(mbuf));
-
-    mbuf_copy(mbuf, pos, n);
-    msg->mlen += (uint32_t)n;
-
-    return NC_OK;
-}
-
-/*
- * Prepend n bytes of data, with n <= mbuf_size(mbuf)
- * into mbuf
- */
-rstatus_t
-msg_prepend(struct msg *msg, uint8_t *pos, size_t n)
-{
-    struct mbuf *mbuf;
-
-    mbuf = mbuf_get();
-    if (mbuf == NULL) {
-        return NC_ENOMEM;
-    }
-
-    ASSERT(n <= mbuf_size(mbuf));
-
-    mbuf_copy(mbuf, pos, n);
-    msg->mlen += (uint32_t)n;
-
-    STAILQ_INSERT_HEAD(&msg->mhdr, mbuf, next);
-
-    return NC_OK;
-}
-
-/*
- * Prepend a formatted string into msg. Returns an error if the formatted
- * string does not fit in a single mbuf.
- */
-rstatus_t
-msg_prepend_format(struct msg *msg, const char *fmt, ...)
-{
-    struct mbuf *mbuf;
-    int n;
-    uint32_t size;
-    va_list args;
-
-    mbuf = mbuf_get();
-    if (mbuf == NULL) {
-        return NC_ENOMEM;
-    }
-
-    size = mbuf_size(mbuf);
-
-    va_start(args, fmt);
-    n = nc_vsnprintf(mbuf->last, size, fmt, args);
-    va_end(args);
-    if (n <= 0 || n >= (int)size) {
-        return NC_ERROR;
-    }
-
-    mbuf->last += n;
-    msg->mlen += (uint32_t)n;
-    STAILQ_INSERT_HEAD(&msg->mhdr, mbuf, next);
-
-    return NC_OK;
-}
-
-inline uint64_t
-msg_gen_frag_id(void)
-{
-    return ++frag_id;
 }
 
 static rstatus_t
@@ -610,6 +527,104 @@ msg_parsed(struct context *ctx, struct conn *conn, struct msg *msg)
 }
 
 static rstatus_t
+msg_fragment(struct context *ctx, struct conn *conn, struct msg *msg)
+{
+    rstatus_t status;  /* return status */
+    struct msg *nmsg;  /* new message */
+    struct mbuf *nbuf; /* new mbuf */
+
+    ASSERT(conn->client && !conn->proxy);
+    ASSERT(msg->request);
+
+    nbuf = mbuf_split(&msg->mhdr, msg->pos, msg->pre_splitcopy, msg);
+    if (nbuf == NULL) {
+        return NC_ENOMEM;
+    }
+
+    status = msg->post_splitcopy(msg);
+    if (status != NC_OK) {
+        mbuf_put(nbuf);
+        return status;
+    }
+
+    nmsg = msg_get(msg->owner, msg->request, msg->redis);
+    if (nmsg == NULL) {
+        mbuf_put(nbuf);
+        return NC_ENOMEM;
+    }
+    mbuf_insert(&nmsg->mhdr, nbuf);
+    nmsg->pos = nbuf->pos;
+
+    /* update length of current (msg) and new message (nmsg) */
+    nmsg->mlen = mbuf_length(nbuf);
+    msg->mlen -= nmsg->mlen;
+
+	/* set op_write as msg->op_write */
+	nmsg->op_write = msg->op_write;
+
+    /*
+     * Attach unique fragment id to all fragments of the message vector. All
+     * fragments of the message, including the first fragment point to the
+     * first fragment through the frag_owner pointer. The first_fragment and
+     * last_fragment identify first and last fragment respectively.
+     *
+     * For example, a message vector given below is split into 3 fragments:
+     *  'get key1 key2 key3\r\n'
+     *  Or,
+     *  '*4\r\n$4\r\nmget\r\n$4\r\nkey1\r\n$4\r\nkey2\r\n$4\r\nkey3\r\n'
+     *
+     *   +--------------+
+     *   |  msg vector  |
+     *   |(original msg)|
+     *   +--------------+
+     *
+     *       frag_owner         frag_owner
+     *     /-----------+      /------------+
+     *     |           |      |            |
+     *     |           v      v            |
+     *   +--------------------+     +---------------------+
+     *   |   frag_id = 10     |     |   frag_id = 10      |
+     *   | first_fragment = 1 |     |  first_fragment = 0 |
+     *   | last_fragment = 0  |     |  last_fragment = 0  |
+     *   |     nfrag = 3      |     |      nfrag = 0      |
+     *   +--------------------+     +---------------------+
+     *               ^
+     *               |  frag_owner
+     *               \-------------+
+     *                             |
+     *                             |
+     *                  +---------------------+
+     *                  |   frag_id = 10      |
+     *                  |  first_fragment = 0 |
+     *                  |  last_fragment = 1  |
+     *                  |      nfrag = 0      |
+     *                  +---------------------+
+     *
+     *
+     */
+    if (msg->frag_id == 0) {
+        msg->frag_id = ++frag_id;
+        msg->first_fragment = 1;
+        msg->nfrag = 1;
+        msg->frag_owner = msg;
+    }
+    nmsg->frag_id = msg->frag_id;
+    msg->last_fragment = 0;
+    nmsg->last_fragment = 1;
+    nmsg->frag_owner = msg->frag_owner;
+    msg->frag_owner->nfrag++;
+
+    stats_pool_incr(ctx, conn->owner, fragments);
+
+    log_debug(LOG_VERB, "fragment msg into %"PRIu64" and %"PRIu64" frag id "
+              "%"PRIu64"", msg->id, nmsg->id, msg->frag_id);
+
+    conn->recv_done(ctx, conn, msg, nmsg);
+
+    return NC_OK;
+}
+
+static rstatus_t
 msg_repair(struct context *ctx, struct conn *conn, struct msg *msg)
 {
     struct mbuf *nbuf;
@@ -642,6 +657,10 @@ msg_parse(struct context *ctx, struct conn *conn, struct msg *msg)
         status = msg_parsed(ctx, conn, msg);
         break;
 
+    case MSG_PARSE_FRAGMENT:
+        status = msg_fragment(ctx, conn, msg);
+        break;
+
     case MSG_PARSE_REPAIR:
         status = msg_repair(ctx, conn, msg);
         break;
@@ -658,6 +677,7 @@ msg_parse(struct context *ctx, struct conn *conn, struct msg *msg)
 
     return conn->err != 0 ? NC_ERROR : status;
 }
+
 
 static rstatus_t
 msg_recv_chain(struct context *ctx, struct conn *conn, struct msg *msg)
@@ -710,6 +730,26 @@ msg_recv_chain(struct context *ctx, struct conn *conn, struct msg *msg)
     }
 
     return NC_OK;
+}
+
+struct msg*
+msg_build_probe(bool redis)
+{
+    rstatus_t status;
+    struct msg *msg;
+
+    msg = msg_get(NULL, true, redis);
+    if (msg == NULL) {
+        return NULL;
+    }
+    
+    status = msg->build_probe(msg);
+    if (status != NC_OK) {
+        msg_put(msg);
+        return NULL;
+    }
+
+    return msg;
 }
 
 rstatus_t
@@ -799,16 +839,11 @@ msg_send_chain(struct context *ctx, struct conn *conn, struct msg *msg)
         }
     }
 
-    /*
-     * (nsend == 0) is possible in redis multi-del
-     * see PR: https://github.com/twitter/twemproxy/pull/225
-     */
+    ASSERT(!TAILQ_EMPTY(&send_msgq) && nsend != 0);
+
     conn->smsg = NULL;
-    if (!TAILQ_EMPTY(&send_msgq) && nsend != 0) {
-        n = conn_sendv(conn, &sendv, nsend);
-    } else {
-        n = 0;
-    }
+
+    n = conn_sendv(conn, &sendv, nsend);
 
     nsent = n > 0 ? (size_t)n : 0;
 
@@ -856,7 +891,7 @@ msg_send_chain(struct context *ctx, struct conn *conn, struct msg *msg)
 
     ASSERT(TAILQ_EMPTY(&send_msgq));
 
-    if (n >= 0) {
+    if (n > 0) {
         return NC_OK;
     }
 

@@ -32,9 +32,12 @@
 #define CONF_ROOT_DEPTH     1
 #define CONF_MAX_DEPTH      CONF_ROOT_DEPTH + 1
 
-#define CONF_DEFAULT_ARGS       3
-#define CONF_DEFAULT_POOL       8
-#define CONF_DEFAULT_SERVERS    8
+#define CONF_DEFAULT_ARGS           3
+#define CONF_DEFAULT_POOL           8
+#define CONF_DEFAULT_SERVERS        8
+#define CONF_DEFAULT_DOWNSTREAMS    8
+#define CONF_DEFAULT_PARTITIONS     8
+#define CONF_DEFAULT_PARTITION_SIZE 2
 
 #define CONF_UNSET_NUM  -1
 #define CONF_UNSET_PTR  NULL
@@ -47,54 +50,85 @@
 #define CONF_DEFAULT_LISTEN_BACKLOG          512
 #define CONF_DEFAULT_CLIENT_CONNECTIONS      0
 #define CONF_DEFAULT_REDIS                   false
-#define CONF_DEFAULT_REDIS_DB                0
 #define CONF_DEFAULT_PRECONNECT              false
 #define CONF_DEFAULT_AUTO_EJECT_HOSTS        false
-#define CONF_DEFAULT_SERVER_RETRY_TIMEOUT    30 * 1000      /* in msec */
+#define CONF_DEFAULT_SERVER_RETRY_TIMEOUT    30 * 1000 /* in msec */
 #define CONF_DEFAULT_SERVER_FAILURE_LIMIT    2
+#define CONF_DEFAULT_SERVER_FAILURE_INTERVAL 100 * 1000 /* in usec */
 #define CONF_DEFAULT_SERVER_CONNECTIONS      1
 #define CONF_DEFAULT_KETAMA_PORT             11211
-#define CONF_DEFAULT_TCPKEEPALIVE            false
+#define CONF_DEFAULT_AUTO_PROBE_HOSTS        false
+#define CONF_DEFAULT_SERVER_PROBE_TIMEOUT    10 * 1000 /* in msec */
+#define CONF_DEFAULT_VIRTUAL                 false
+#define CONF_DEFAULT_RATE                    0
+#define CONF_DEFAULT_BURST                   0
+#define CONF_DEFAULT_AUTO_WARMUP             0
+#define CONF_DEFAULT_MS_MODE              0
+#define CONF_DEFAULT_READ_MODE              0
+#define CONF_READ_MODE_ALL 0
+#define CONF_READ_MODE_SLAVE_FIRST 1
+#define CONF_READ_MODE_MASTER_ONLY 2
+
 
 struct conf_listen {
-    struct string   pname;   /* listen: as "hostname:port" */
-    struct string   name;    /* hostname:port */
+    struct string   pname;   /* listen: as "name:port" */
+    struct string   name;    /* name */
     int             port;    /* port */
-    mode_t          perm;    /* socket permissions */
     struct sockinfo info;    /* listen socket info */
     unsigned        valid:1; /* valid? */
 };
 
 struct conf_server {
-    struct string   pname;      /* server: as "hostname:port:weight" */
-    struct string   name;       /* hostname:port or [name] */
-    struct string   addrstr;    /* hostname */
-    int             port;       /* port */
-    int             weight;     /* weight */
-    struct sockinfo info;       /* connect socket info */
-    unsigned        valid:1;    /* valid? */
+    struct string   pname;              /* server: as "name:port:[master:]weight" */
+    struct string   name;               /* name */
+    int             port;               /* port */
+	int             master;             /* is master? only for ms_mode */
+    int             weight;             /* weight */
+    int             start;              /* range start */
+    int             end;                /* range end */
+    struct sockinfo info;               /* connect socket info */
+    unsigned        valid:1;            /* valid? */
+};
+
+struct conf_downstream {
+    struct string   ns;                 /* namespace */
+    struct string   name;               /* pool name */
+    unsigned        valid:1;            /* valid ? */
 };
 
 struct conf_pool {
-    struct string      name;                  /* pool name (root node) */
-    struct conf_listen listen;                /* listen: */
-    hash_type_t        hash;                  /* hash: */
-    struct string      hash_tag;              /* hash_tag: */
-    dist_type_t        distribution;          /* distribution: */
-    int                timeout;               /* timeout: */
-    int                backlog;               /* backlog: */
-    int                client_connections;    /* client_connections: */
-    int                tcpkeepalive;          /* tcpkeepalive: */
-    int                redis;                 /* redis: */
-    struct string      redis_auth;            /* redis_auth: redis auth password (matches requirepass on redis) */
-    int                redis_db;              /* redis_db: redis db */
-    int                preconnect;            /* preconnect: */
-    int                auto_eject_hosts;      /* auto_eject_hosts: */
-    int                server_connections;    /* server_connections: */
-    int                server_retry_timeout;  /* server_retry_timeout: in msec */
-    int                server_failure_limit;  /* server_failure_limit: */
-    struct array       server;                /* servers: conf_server[] */
-    unsigned           valid:1;               /* valid? */
+    struct string      name;                    /* pool name (root node) */
+    struct conf_listen listen;                  /* listen: */
+    hash_type_t        hash;                    /* hash: */
+    struct string      hash_tag;                /* hash_tag: */
+    dist_type_t        distribution;            /* distribution: */
+    int                timeout;                 /* timeout: */
+    int                backlog;                 /* backlog: */
+    int                client_connections;      /* client_connections: */
+    int                redis;                   /* redis: */
+    int                preconnect;              /* preconnect: */
+    int                auto_eject_hosts;        /* auto_eject_hosts: */
+    int                server_connections;      /* server_connections: */
+    int                server_retry_timeout;    /* server_retry_timeout: in msec */
+    int                server_failure_limit;    /* server_failure_limit: */
+    int                server_failure_interval; /* server_failure_interval */
+    struct array       server;                  /* servers: conf_server[] */
+    unsigned           valid:1;                 /* valid? */
+    struct string      gutter;                  /* gutter pool name */
+    struct string      peer;                    /* peer pool name */
+    int                auto_probe_hosts;        /* auto_probe_hosts: */
+    int                virtual;                 /* virtual server */
+    struct array       downstreams;             /* downstreams: conf_downstream[] */
+    struct string      namespace;               /* namespace */
+    
+    int                rate;                    /* # of requests per second */
+    int                burst;                   /* max bursts of requests */
+    
+    int                auto_warmup;             /* auto warmup */
+
+    struct string      message_queue;           /* message queue */
+	int                ms_mode;              /* enable master-slave mode */
+	int                read_mode;               /* 0: read all (default); 1: slave first; 2: master only*/
 };
 
 struct conf {
@@ -125,12 +159,14 @@ struct command {
 
 char *conf_set_string(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_listen(struct conf *cf, struct command *cmd, void *conf);
-char *conf_add_server(struct conf *cf, struct command *cmd, void *conf);
+
 char *conf_set_num(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_bool(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_hash(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_distribution(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_hashtag(struct conf *cf, struct command *cmd, void *conf);
+char *conf_add_string(struct conf *cf, struct command *cmd, void *conf);
+char *conf_add_downstream(struct conf *cf, struct command *cmd, void *conf);
 
 rstatus_t conf_server_each_transform(void *elem, void *data);
 rstatus_t conf_pool_each_transform(void *elem, void *data);

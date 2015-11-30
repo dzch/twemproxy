@@ -21,14 +21,17 @@
 
 #include <sys/epoll.h>
 
-struct event_base *
-event_base_create(int nevent, event_cb_t cb)
+struct evbase *
+evbase_create(int nevent, void (*callback_fp)(void *, uint32_t))
 {
-    struct event_base *evb;
+    struct evbase *evb;
     int status, ep;
     struct epoll_event *event;
 
-    ASSERT(nevent > 0);
+    if (nevent <= 0) {
+        log_error("nevent has to be positive %d", nevent);
+        return NULL;
+    }
 
     ep = epoll_create(nevent);
     if (ep < 0) {
@@ -53,20 +56,22 @@ event_base_create(int nevent, event_cb_t cb)
             log_error("close e %d failed, ignored: %s", ep, strerror(errno));
         }
         return NULL;
+
     }
 
+    evb->nevent = nevent;
     evb->ep = ep;
     evb->event = event;
-    evb->nevent = nevent;
-    evb->cb = cb;
+    evb->callback_fp = callback_fp;
 
-    log_debug(LOG_INFO, "e %d with nevent %d", evb->ep, evb->nevent);
+    log_debug(LOG_INFO, "e %d with nevent %d", evb->ep,
+              evb->nevent);
 
     return evb;
 }
 
 void
-event_base_destroy(struct event_base *evb)
+evbase_destroy(struct evbase *evb)
 {
     int status;
 
@@ -74,7 +79,7 @@ event_base_destroy(struct event_base *evb)
         return;
     }
 
-    ASSERT(evb->ep > 0);
+    ASSERT(evb->ep >= 0);
 
     nc_free(evb->event);
 
@@ -82,48 +87,11 @@ event_base_destroy(struct event_base *evb)
     if (status < 0) {
         log_error("close e %d failed, ignored: %s", evb->ep, strerror(errno));
     }
-    evb->ep = -1;
-
     nc_free(evb);
 }
 
 int
-event_add_in(struct event_base *evb, struct conn *c)
-{
-    int status;
-    struct epoll_event event;
-    int ep = evb->ep;
-
-    ASSERT(ep > 0);
-    ASSERT(c != NULL);
-    ASSERT(c->sd > 0);
-
-    if (c->recv_active) {
-        return 0;
-    }
-
-    event.events = (uint32_t)(EPOLLIN | EPOLLET);
-    event.data.ptr = c;
-
-    status = epoll_ctl(ep, EPOLL_CTL_MOD, c->sd, &event);
-    if (status < 0) {
-        log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
-                  strerror(errno));
-    } else {
-        c->recv_active = 1;
-    }
-
-    return status;
-}
-
-int
-event_del_in(struct event_base *evb, struct conn *c)
-{
-    return 0;
-}
-
-int
-event_add_out(struct event_base *evb, struct conn *c)
+event_add_out(struct evbase *evb, struct conn *c)
 {
     int status;
     struct epoll_event event;
@@ -153,7 +121,7 @@ event_add_out(struct event_base *evb, struct conn *c)
 }
 
 int
-event_del_out(struct event_base *evb, struct conn *c)
+event_del_out(struct evbase *evb, struct conn *c)
 {
     int status;
     struct epoll_event event;
@@ -183,7 +151,7 @@ event_del_out(struct event_base *evb, struct conn *c)
 }
 
 int
-event_add_conn(struct event_base *evb, struct conn *c)
+event_add_conn(struct evbase *evb, struct conn *c)
 {
     int status;
     struct epoll_event event;
@@ -209,7 +177,7 @@ event_add_conn(struct event_base *evb, struct conn *c)
 }
 
 int
-event_del_conn(struct event_base *evb, struct conn *c)
+event_del_conn(struct evbase *evb, struct conn *c)
 {
     int status;
     int ep = evb->ep;
@@ -231,42 +199,40 @@ event_del_conn(struct event_base *evb, struct conn *c)
 }
 
 int
-event_wait(struct event_base *evb, int timeout)
+event_wait(struct evbase *evb, int timeout)
 {
+    int nsd, i;
+    uint32_t events = 0;
     int ep = evb->ep;
     struct epoll_event *event = evb->event;
     int nevent = evb->nevent;
+    void (*callback_fp)(void *, uint32_t) = evb->callback_fp;
 
     ASSERT(ep > 0);
     ASSERT(event != NULL);
     ASSERT(nevent > 0);
 
     for (;;) {
-        int i, nsd;
-
         nsd = epoll_wait(ep, event, nevent, timeout);
         if (nsd > 0) {
             for (i = 0; i < nsd; i++) {
                 struct epoll_event *ev = &evb->event[i];
-                uint32_t events = 0;
 
-                log_debug(LOG_VVERB, "epoll %04"PRIX32" triggered on conn %p",
-                          ev->events, ev->data.ptr);
-
+                events = 0;
                 if (ev->events & EPOLLERR) {
-                    events |= EVENT_ERR;
+                    events |= EV_ERR;
                 }
 
-                if (ev->events & (EPOLLIN | EPOLLHUP)) {
-                    events |= EVENT_READ;
+                if (ev->events & EPOLLIN) {
+                    events |= EV_READ;
                 }
 
                 if (ev->events & EPOLLOUT) {
-                    events |= EVENT_WRITE;
+                    events |= EV_WRITE;
                 }
 
-                if (evb->cb != NULL) {
-                    evb->cb(ev->data.ptr, events);
+                if (callback_fp != NULL) {
+                    (*callback_fp)((void *) ev->data.ptr, events);
                 }
             }
             return nsd;
@@ -288,57 +254,29 @@ event_wait(struct event_base *evb, int timeout)
 
         log_error("epoll wait on e %d with %d events failed: %s", ep, nevent,
                   strerror(errno));
+
         return -1;
     }
-
     NOT_REACHED();
 }
 
-void
-event_loop_stats(event_stats_cb_t cb, void *arg)
+int
+event_add_st(struct evbase *evb, int fd)
 {
-    struct stats *st = arg;
-    int status, ep;
+    int status;
     struct epoll_event ev;
 
-    ep = epoll_create(1);
-    if (ep < 0) {
-        log_error("epoll create failed: %s", strerror(errno));
-        return;
-    }
-
-    ev.data.fd = st->sd;
+    ev.data.fd = fd;
     ev.events = EPOLLIN;
 
-    status = epoll_ctl(ep, EPOLL_CTL_ADD, st->sd, &ev);
+    status = epoll_ctl(evb->ep, EPOLL_CTL_ADD, fd, &ev);
     if (status < 0) {
-        log_error("epoll ctl on e %d sd %d failed: %s", ep, st->sd,
+        log_error("epoll ctl on e %d sd %d failed: %s", evb->ep, fd,
                   strerror(errno));
-        goto error;
+        return status;
     }
 
-    for (;;) {
-        int n;
-
-        n = epoll_wait(ep, &ev, 1, st->interval);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            log_error("epoll wait on e %d with m %d failed: %s", ep,
-                      st->sd, strerror(errno));
-            break;
-        }
-
-        cb(st, &n);
-    }
-
-error:
-    status = close(ep);
-    if (status < 0) {
-        log_error("close e %d failed, ignored: %s", ep, strerror(errno));
-    }
-    ep = -1;
+    return status;
 }
 
 #endif /* NC_HAVE_EPOLL */

@@ -67,27 +67,43 @@ struct continuum {
 };
 
 struct server {
-    uint32_t           idx;           /* server index */
-    struct server_pool *owner;        /* owner pool */
+    uint32_t            idx;   /* server index */
+    struct server_pool *owner; /* owner pool */
 
-    struct string      pname;         /* hostname:port:weight (ref in conf_server) */
-    struct string      name;          /* hostname:port or [name] (ref in conf_server) */
-    struct string      addrstr;       /* hostname (ref in conf_server) */
-    uint16_t           port;          /* port */
-    uint32_t           weight;        /* weight */
-    struct sockinfo    info;          /* server socket info */
+    struct string    pname;    /* name:port:weight (ref in conf_server) */
+    struct string    name;     /* name (ref in conf_server) */
+    uint16_t         port;     /* port */
+    uint32_t         weight;   /* weight */
 
-    uint32_t           ns_conn_q;     /* # server connection */
-    struct conn_tqh    s_conn_q;      /* server connection q */
+    int              family;   /* socket family */
+    socklen_t        addrlen;  /* socket length */
+    struct sockaddr *addr;     /* socket address (ref in conf_server) */
 
-    int64_t            next_retry;    /* next retry time in usec */
-    uint32_t           failure_count; /* # consecutive failures */
+    uint32_t        ns_conn_q; /* # server connection */
+    struct conn_tqh s_conn_q;  /* server connection q */
+
+    int64_t  next_retry;       /* next retry time in usec */
+    uint32_t failure_count;    /* # consecutive failures */
+    int64_t last_failure;      /* last failure time in usec */
+
+    int range_start;           /* range start */
+    int range_end;             /* range end */
+
+    int64_t next_probe;        /* next probe time in usec */
+    
+    void *stats;               /* stats data */
+	unsigned       master:1;   /* is master when slave mode enable? */
+};
+
+struct downstream_pool {
+    struct string    ns;       /* namespace */
+    struct string    name;     /* pool name */                               
 };
 
 struct server_pool {
     uint32_t           idx;                  /* pool index */
     struct context     *ctx;                 /* owner context */
-
+    
     struct conn        *p_conn;              /* proxy connection (listener) */
     uint32_t           nc_conn_q;            /* # client connection */
     struct conn_tqh    c_conn_q;             /* client connection q */
@@ -96,31 +112,58 @@ struct server_pool {
     uint32_t           ncontinuum;           /* # continuum points */
     uint32_t           nserver_continuum;    /* # servers - live and dead on continuum (const) */
     struct continuum   *continuum;           /* continuum */
+    uint32_t           npartition_continuum;
+    struct array       partition_continuum;
     uint32_t           nlive_server;         /* # live server */
     int64_t            next_rebuild;         /* next distribution rebuild time in usec */
+    struct array       partition;            /* continuum[][] */
 
     struct string      name;                 /* pool name (ref in conf_pool) */
-    struct string      addrstr;              /* pool address - hostname:port (ref in conf_pool) */
+    struct string      addrstr;              /* pool address (ref in conf_pool) */
     uint16_t           port;                 /* port */
-    struct sockinfo    info;                 /* listen socket info */
-    mode_t             perm;                 /* socket permission */
+    int                family;               /* socket family */
+    socklen_t          addrlen;              /* socket length */
+    struct sockaddr    *addr;                /* socket address (ref in conf_pool) */
     int                dist_type;            /* distribution type (dist_type_t) */
     int                key_hash_type;        /* key hash type (hash_type_t) */
     hash_t             key_hash;             /* key hasher */
     struct string      hash_tag;             /* key hash tag (ref in conf_pool) */
     int                timeout;              /* timeout in msec */
     int                backlog;              /* listen backlog */
-    int                redis_db;             /* redis database to connect to */
     uint32_t           client_connections;   /* maximum # client connection */
     uint32_t           server_connections;   /* maximum # server connection */
     int64_t            server_retry_timeout; /* server retry timeout in usec */
     uint32_t           server_failure_limit; /* server failure limit */
-    struct string      redis_auth;           /* redis_auth password (matches requirepass on redis) */
-    unsigned           require_auth;         /* require_auth? */
+    int64_t            server_failure_interval; /* server failure interval */
     unsigned           auto_eject_hosts:1;   /* auto_eject_hosts? */
     unsigned           preconnect:1;         /* preconnect? */
     unsigned           redis:1;              /* redis? */
-    unsigned           tcpkeepalive:1;       /* tcpkeepalive? */
+
+    unsigned           auto_probe_hosts:1;   /* auto_probe_hosts? */
+
+    unsigned           auto_warmup:1;        /* auto_warmup? */
+
+    struct string      gutter_name;          /* gutter pool name */
+    struct server_pool *gutter;              /* gutter pool */
+
+    struct string      peer_name;            /* peer pool name */
+    struct server_pool *peer;                /* peer pool */
+
+    struct array       downstreams;          /* downstreams*/
+    struct hash_table  *downstream_table;    /* downstream table */
+
+    unsigned           virtual:1;            /* virtual server */        
+    struct string      namespace;            /* namespace */
+
+    float              rate;                 /* # of request per second*/
+    float              burst;                /* max bursts of requests */
+    float              count;                /* # of request in the bucket */
+
+    struct string      message_queue_name;   /* name of message queue */
+    struct server_pool *message_queue;       /* message queue */
+
+	unsigned           ms_mode:1;         /* ms_mode enable? */
+	unsigned           read_mode;         /* read_mode */
 };
 
 void server_ref(struct conn *conn, void *owner);
@@ -135,12 +178,15 @@ void server_close(struct context *ctx, struct conn *conn);
 void server_connected(struct context *ctx, struct conn *conn);
 void server_ok(struct context *ctx, struct conn *conn);
 
-uint32_t server_pool_idx(struct server_pool *pool, uint8_t *key, uint32_t keylen);
-struct conn *server_pool_conn(struct context *ctx, struct server_pool *pool, uint8_t *key, uint32_t keylen);
+struct conn *server_pool_conn(struct context *ctx, struct server_pool *pool, uint8_t *key, uint32_t keylen, int op_write);
 rstatus_t server_pool_run(struct server_pool *pool);
 rstatus_t server_pool_preconnect(struct context *ctx);
 void server_pool_disconnect(struct context *ctx);
 rstatus_t server_pool_init(struct array *server_pool, struct array *conf_pool, struct context *ctx);
 void server_pool_deinit(struct array *server_pool);
+
+void server_pool_probe(struct context *ctx);
+void server_pool_update_quota(struct context *ctx);
+bool server_pool_ratelimit(struct server_pool *pool);
 
 #endif

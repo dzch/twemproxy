@@ -19,6 +19,7 @@
 #include <nc_conf.h>
 #include <nc_server.h>
 #include <proto/nc_proto.h>
+#include <nc_confx.h>
 
 #define DEFINE_ACTION(_hash, _name) string(#_name),
 static struct string hash_strings[] = {
@@ -74,18 +75,6 @@ static struct command conf_commands[] = {
       conf_set_bool,
       offsetof(struct conf_pool, redis) },
 
-    { string("tcpkeepalive"),
-      conf_set_bool,
-      offsetof(struct conf_pool, tcpkeepalive) },
-
-    { string("redis_auth"),
-      conf_set_string,
-      offsetof(struct conf_pool, redis_auth) },
-
-    { string("redis_db"),
-      conf_set_num,
-      offsetof(struct conf_pool, redis_db) },
-
     { string("preconnect"),
       conf_set_bool,
       offsetof(struct conf_pool, preconnect) },
@@ -106,37 +95,86 @@ static struct command conf_commands[] = {
       conf_set_num,
       offsetof(struct conf_pool, server_failure_limit) },
 
+    { string("server_failure_interval"),
+      conf_set_num,
+      offsetof(struct conf_pool, server_failure_interval) },
+
     { string("servers"),
       conf_add_server,
       offsetof(struct conf_pool, server) },
 
+    { string("gutter"),
+      conf_set_string,
+      offsetof(struct conf_pool, gutter) },
+
+    { string("peer"),
+      conf_set_string,
+      offsetof(struct conf_pool, peer) },
+
+    { string("auto_probe_hosts"),
+      conf_set_bool,
+      offsetof(struct conf_pool, auto_probe_hosts) },
+
+    { string("auto_warmup"),
+      conf_set_bool,
+      offsetof(struct conf_pool, auto_warmup) },
+
+    { string("virtual"),
+      conf_set_bool,
+      offsetof(struct conf_pool, virtual) },
+
+    { string("downstreams"),
+      conf_add_downstream,
+      offsetof(struct conf_pool, downstreams) },
+
+    { string("namespace"),
+      conf_set_string,
+      offsetof(struct conf_pool, namespace) },
+
+    { string("rate"),
+      conf_set_num,
+      offsetof(struct conf_pool, rate) },
+    
+    { string("burst"),
+      conf_set_num,
+      offsetof(struct conf_pool, burst) },
+
+    { string("message_queue"),
+      conf_set_string,
+      offsetof(struct conf_pool, message_queue) },
+
+    { string("ms_mode"),
+      conf_set_bool,
+      offsetof(struct conf_pool, ms_mode) },
+
+    { string("read_mode"),
+      conf_set_num,
+      offsetof(struct conf_pool, read_mode) },
+
     null_command
 };
 
+
 static void
-conf_server_init(struct conf_server *cs)
+conf_downstream_init(struct conf_downstream *cd)
 {
-    string_init(&cs->pname);
-    string_init(&cs->name);
-    string_init(&cs->addrstr);
-    cs->port = 0;
-    cs->weight = 0;
-
-    memset(&cs->info, 0, sizeof(cs->info));
-
-    cs->valid = 0;
-
-    log_debug(LOG_VVERB, "init conf server %p", cs);
+    string_init(&cd->ns);
+    string_init(&cd->name);
+    
+    cd->valid = 0;
+    
+    log_debug(LOG_VVERB, "init conf downstream %p", cd);
 }
 
-static void
-conf_server_deinit(struct conf_server *cs)
+static void 
+conf_downstream_deinit(struct conf_downstream *cd)
 {
-    string_deinit(&cs->pname);
-    string_deinit(&cs->name);
-    string_deinit(&cs->addrstr);
-    cs->valid = 0;
-    log_debug(LOG_VVERB, "deinit conf server %p", cs);
+    string_deinit(&cd->ns);
+    string_deinit(&cd->name);
+    
+    cd->valid = 0;
+
+    log_debug(LOG_VVERB, "deinit conf downstream %p", cd);
 }
 
 rstatus_t
@@ -156,18 +194,28 @@ conf_server_each_transform(void *elem, void *data)
 
     s->pname = cs->pname;
     s->name = cs->name;
-    s->addrstr = cs->addrstr;
     s->port = (uint16_t)cs->port;
     s->weight = (uint32_t)cs->weight;
 
-    nc_memcpy(&s->info, &cs->info, sizeof(cs->info));
+    s->family = cs->info.family;
+    s->addrlen = cs->info.addrlen;
+    s->addr = (struct sockaddr *)&cs->info.addr;
 
     s->ns_conn_q = 0;
     TAILQ_INIT(&s->s_conn_q);
 
     s->next_retry = 0LL;
     s->failure_count = 0;
+    s->last_failure = 0LL;
 
+    s->range_start = cs->start;
+    s->range_end = cs->end;
+
+    s->next_probe = 0LL;
+    
+    s->stats = NULL;
+	s->master = cs->master;
+    
     log_debug(LOG_VERB, "transform to server %"PRIu32" '%.*s'",
               s->idx, s->pname.len, s->pname.data);
 
@@ -180,10 +228,9 @@ conf_pool_init(struct conf_pool *cp, struct string *name)
     rstatus_t status;
 
     string_init(&cp->name);
-
+    
     string_init(&cp->listen.pname);
     string_init(&cp->listen.name);
-    string_init(&cp->redis_auth);
     cp->listen.port = 0;
     memset(&cp->listen.info, 0, sizeof(cp->listen.info));
     cp->listen.valid = 0;
@@ -198,18 +245,32 @@ conf_pool_init(struct conf_pool *cp, struct string *name)
     cp->client_connections = CONF_UNSET_NUM;
 
     cp->redis = CONF_UNSET_NUM;
-    cp->tcpkeepalive = CONF_UNSET_NUM;
-    cp->redis_db = CONF_UNSET_NUM;
     cp->preconnect = CONF_UNSET_NUM;
     cp->auto_eject_hosts = CONF_UNSET_NUM;
     cp->server_connections = CONF_UNSET_NUM;
     cp->server_retry_timeout = CONF_UNSET_NUM;
     cp->server_failure_limit = CONF_UNSET_NUM;
+    cp->server_failure_interval = CONF_UNSET_NUM;
+    cp->auto_probe_hosts = CONF_UNSET_NUM;
+    cp->virtual = CONF_UNSET_NUM;
+    cp->auto_warmup = CONF_UNSET_NUM;
 
     array_null(&cp->server);
+    array_null(&cp->downstreams);
 
     cp->valid = 0;
+    
+    string_init(&cp->gutter);
+    string_init(&cp->peer);
+    string_init(&cp->namespace);
+    string_init(&cp->message_queue);
 
+    cp->rate = CONF_UNSET_NUM;
+    cp->burst = CONF_UNSET_NUM;
+
+	cp->ms_mode = CONF_UNSET_NUM;
+	cp->read_mode = CONF_UNSET_NUM;
+    
     status = string_duplicate(&cp->name, name);
     if (status != NC_OK) {
         return status;
@@ -222,6 +283,14 @@ conf_pool_init(struct conf_pool *cp, struct string *name)
         return status;
     }
 
+    status = array_init(&cp->downstreams, CONF_DEFAULT_DOWNSTREAMS,
+                        sizeof(struct conf_downstream));
+    if (status != NC_OK) {
+        array_deinit(&cp->server);
+        string_deinit(&cp->name);
+        return status;
+    }
+    
     log_debug(LOG_VVERB, "init conf pool %p, '%.*s'", cp, name->len, name->data);
 
     return NC_OK;
@@ -235,14 +304,20 @@ conf_pool_deinit(struct conf_pool *cp)
     string_deinit(&cp->listen.pname);
     string_deinit(&cp->listen.name);
 
-    if (cp->redis_auth.len > 0) {
-        string_deinit(&cp->redis_auth);
-    }
-
     while (array_n(&cp->server) != 0) {
         conf_server_deinit(array_pop(&cp->server));
     }
     array_deinit(&cp->server);
+
+    string_deinit(&cp->gutter);
+    string_deinit(&cp->peer);
+    string_deinit(&cp->namespace);
+    string_deinit(&cp->message_queue);
+
+    while (array_n(&cp->downstreams) != 0) {
+        conf_downstream_deinit(array_pop(&cp->downstreams));
+    }
+    array_deinit(&cp->downstreams);
 
     log_debug(LOG_VVERB, "deinit conf pool %p", cp);
 }
@@ -254,6 +329,9 @@ conf_pool_each_transform(void *elem, void *data)
     struct conf_pool *cp = elem;
     struct array *server_pool = data;
     struct server_pool *sp;
+    struct downstream_pool *dp;
+    struct conf_downstream *cd;
+    uint32_t i;
 
     ASSERT(cp->valid);
 
@@ -271,43 +349,101 @@ conf_pool_each_transform(void *elem, void *data)
     sp->ncontinuum = 0;
     sp->nserver_continuum = 0;
     sp->continuum = NULL;
+    sp->npartition_continuum = 0;
+    array_null(&sp->partition_continuum);
     sp->nlive_server = 0;
     sp->next_rebuild = 0LL;
+    array_null(&sp->partition);
 
     sp->name = cp->name;
     sp->addrstr = cp->listen.pname;
     sp->port = (uint16_t)cp->listen.port;
 
-    nc_memcpy(&sp->info, &cp->listen.info, sizeof(cp->listen.info));
-    sp->perm = cp->listen.perm;
+    sp->family = cp->listen.info.family;
+    sp->addrlen = cp->listen.info.addrlen;
+    sp->addr = (struct sockaddr *)&cp->listen.info.addr;
 
     sp->key_hash_type = cp->hash;
     sp->key_hash = hash_algos[cp->hash];
     sp->dist_type = cp->distribution;
     sp->hash_tag = cp->hash_tag;
 
-    sp->tcpkeepalive = cp->tcpkeepalive ? 1 : 0;
-
     sp->redis = cp->redis ? 1 : 0;
     sp->timeout = cp->timeout;
     sp->backlog = cp->backlog;
-    sp->redis_db = cp->redis_db;
-
-    sp->redis_auth = cp->redis_auth;
-    sp->require_auth = cp->redis_auth.len > 0 ? 1 : 0;
 
     sp->client_connections = (uint32_t)cp->client_connections;
+
     sp->server_connections = (uint32_t)cp->server_connections;
     sp->server_retry_timeout = (int64_t)cp->server_retry_timeout * 1000LL;
     sp->server_failure_limit = (uint32_t)cp->server_failure_limit;
+    sp->server_failure_interval = (int64_t)cp->server_failure_interval;
+
     sp->auto_eject_hosts = cp->auto_eject_hosts ? 1 : 0;
     sp->preconnect = cp->preconnect ? 1 : 0;
 
-    status = server_init(&sp->server, &cp->server, sp);
-    if (status != NC_OK) {
-        return status;
-    }
+    sp->auto_probe_hosts = cp->auto_probe_hosts ? 1 : 0;
 
+    sp->auto_warmup = cp->auto_warmup ? 1 : 0;
+
+    sp->gutter_name = cp->gutter;
+    sp->gutter = NULL;
+
+    sp->peer_name = cp->peer;
+    sp->peer = NULL;
+
+    array_null(&sp->downstreams);
+    sp->downstream_table = NULL;
+
+    sp->virtual = cp->virtual ? 1 : 0;
+    sp->namespace = cp->namespace;
+
+    sp->rate = cp->rate;
+    sp->burst = cp->burst;
+    sp->count = 0;
+    
+    sp->message_queue_name = cp->message_queue;
+    sp->message_queue = NULL;
+
+	sp->ms_mode = cp->ms_mode ? 1 : 0;
+	sp->read_mode = cp->read_mode;
+    
+    if (sp->virtual) {
+        status = array_init(&sp->downstreams, 
+                            array_n(&cp->downstreams), 
+                            sizeof(struct downstream_pool));
+        if (status != NC_OK) {
+            log_error("conf: failed to init downsteams");
+            return status;
+        }
+
+        for (i = 0; i < array_n(&cp->downstreams); i++) {
+            dp = array_push(&sp->downstreams);
+            if (dp == NULL) {
+                return NC_ENOMEM;
+            }
+            cd = array_get(&cp->downstreams, i);
+            if (cd == NULL) {
+                return NC_ERROR;
+            }
+            dp->ns = cd->ns;
+            dp->name = cd->name;
+        }
+
+        sp->downstream_table = assoc_create_table(sp->key_hash, 
+                                                  array_n(&sp->downstreams));
+        if (sp->downstream_table == NULL) {
+            log_error("conf: failed to init downstream table");
+            return NC_ENOMEM;
+        }
+    } else {
+        status = server_init(&sp->server, &cp->server, sp);
+        if (status != NC_OK) {
+            log_error("conf: failed to init server");
+            return status;
+        }
+    }
+      
     log_debug(LOG_VERB, "transform to pool %"PRIu32" '%.*s'", sp->idx,
               sp->name.len, sp->name.data);
 
@@ -317,9 +453,10 @@ conf_pool_each_transform(void *elem, void *data)
 static void
 conf_dump(struct conf *cf)
 {
-    uint32_t i, j, npool, nserver;
+    uint32_t i, j, npool, nserver, ndownstream;
     struct conf_pool *cp;
-    struct string *s;
+    struct conf_server *s;
+    struct conf_downstream *ds;
 
     npool = array_n(&cf->pool);
     if (npool == 0) {
@@ -352,13 +489,48 @@ conf_dump(struct conf *cf)
                   cp->server_retry_timeout);
         log_debug(LOG_VVERB, "  server_failure_limit: %d",
                   cp->server_failure_limit);
+        log_debug(LOG_VVERB, "  server_failure_interval: %d",
+                  cp->server_failure_interval);
+        log_debug(LOG_VVERB, "  rate: %d", cp->rate);
+        log_debug(LOG_VVERB, "  burst: %d", cp->burst);
+        log_debug(LOG_VVERB, "  auto_probe_hosts: %d", cp->auto_probe_hosts);
+        log_debug(LOG_VVERB, "  auto_warmup: %d", cp->auto_warmup);
+        log_debug(LOG_VVERB, "  gutter: \"%.*s\"", cp->gutter.len, cp->gutter.data);
+        log_debug(LOG_VVERB, "  peer: \"%.*s\"", cp->peer.len, cp->peer.data);
+        log_debug(LOG_VVERB, "  message_queue: \"%.*s\"", cp->message_queue.len,
+                  cp->message_queue.data);
+        log_debug(LOG_VVERB, "  ms_mode: %d", cp->ms_mode);
+        log_debug(LOG_VVERB, "  read_mode: %d", cp->read_mode);
+        
+        if (!cp->virtual) {
+            log_debug(LOG_VVERB, "  namespace: \"%.*s\"", cp->namespace.len, cp->namespace.data);
 
-        nserver = array_n(&cp->server);
-        log_debug(LOG_VVERB, "  servers: %"PRIu32"", nserver);
+            nserver = array_n(&cp->server);
+            log_debug(LOG_VVERB, "  servers: %"PRIu32"", nserver);
 
-        for (j = 0; j < nserver; j++) {
-            s = array_get(&cp->server, j);
-            log_debug(LOG_VVERB, "    %.*s", s->len, s->data);
+            for (j = 0; j < nserver; j++) {
+                s = array_get(&cp->server, j);
+                log_debug(LOG_VVERB, "    pname: \"%.*s\" "
+                          "port: %d "
+                          "weight: %d "
+                          "name: \"%.*s\" "
+                          "[%d, %d)", 
+                          s->pname.len, s->pname.data,
+                          s->port,
+                          s->weight,
+                          s->name.len, s->name.data,
+                          s->start, s->end);
+            }
+        } else {
+            ndownstream = array_n(&cp->downstreams);
+            log_debug(LOG_VVERB, "  downstreams: %"PRIu32"", ndownstream);
+        
+            for ( j = 0; j < ndownstream; j++) {
+                ds = array_get(&cp->downstreams, j);
+                log_debug(LOG_VVERB, "    %.*s %.*s", ds->ns.len, ds->ns.data,
+                          ds->name.len, ds->name.data);
+
+            }
         }
     }
 }
@@ -463,9 +635,6 @@ conf_push_scalar(struct conf *cf)
 
     scalar = cf->event.data.scalar.value;
     scalar_len = (uint32_t)cf->event.data.scalar.length;
-    if (scalar_len == 0) {
-        return NC_ERROR;
-    }
 
     log_debug(LOG_VVERB, "push '%.*s'", scalar_len, scalar);
 
@@ -840,6 +1009,11 @@ conf_validate_document(struct conf *cf)
 
     conf_yaml_deinit(cf);
 
+    if (count == 0) {
+        log_warn("conf: '%s' is empty", cf->fname);
+        return NC_EEMPTYCONF;
+    }
+    
     if (count != 1) {
         log_error("conf: '%s' must contain only 1 document; found %"PRIu32" "
                   "documents", cf->fname, count);
@@ -1161,44 +1335,87 @@ conf_pool_listen_cmp(const void *t1, const void *t2)
 }
 
 static rstatus_t
+conf_validate_server_ms_mode(struct conf *cf, struct conf_pool *cp) {
+	if (cp->ms_mode) {
+		if (!cp->redis || cp->distribution != DIST_RANGE) {
+			log_error("conf: ms_mode only used in redis and range mode");
+			return NC_ERROR;
+		}
+	}
+	return NC_OK;
+}
+
+static rstatus_t
 conf_validate_server(struct conf *cf, struct conf_pool *cp)
 {
     uint32_t i, nserver;
     bool valid;
 
-    nserver = array_n(&cp->server);
-    if (nserver == 0) {
-        log_error("conf: pool '%.*s' has no servers", cp->name.len,
-                  cp->name.data);
-        return NC_ERROR;
-    }
-
-    /*
-     * Disallow duplicate servers - servers with identical "host:port:weight"
-     * or "name" combination are considered as duplicates. When server name
-     * is configured, we only check for duplicate "name" and not for duplicate
-     * "host:port:weight"
-     */
-    array_sort(&cp->server, conf_server_name_cmp);
-    for (valid = true, i = 0; i < nserver - 1; i++) {
-        struct conf_server *cs1, *cs2;
-
-        cs1 = array_get(&cp->server, i);
-        cs2 = array_get(&cp->server, i + 1);
-
-        if (string_compare(&cs1->name, &cs2->name) == 0) {
-            log_error("conf: pool '%.*s' has servers with same name '%.*s'",
-                      cp->name.len, cp->name.data, cs1->name.len,
-                      cs1->name.data);
-            valid = false;
-            break;
+    if (cp->virtual) {
+        if (array_n(&cp->downstreams) == 0) {
+            log_error("conf: virtual pool '%.*s' has no downstreams",
+                      cp->name.len, cp->name.data);
+            return NC_ERROR;
         }
-    }
-    if (!valid) {
-        return NC_ERROR;
-    }
 
-    return NC_OK;
+        return NC_OK;
+    } else {
+        nserver = array_n(&cp->server);
+        if (nserver == 0) {
+            log_error("conf: pool '%.*s' has no servers", cp->name.len,
+                      cp->name.data);
+            return NC_ERROR;
+        }
+
+        /*
+         * Disallow duplicate servers - servers with identical "host:port:weight"
+         * or "name" combination are considered as duplicates. When server name
+         * is configured, we only check for duplicate "name" and not for duplicate
+         * "host:port:weight"
+         */
+        array_sort(&cp->server, conf_server_name_cmp);
+        for (valid = true, i = 0; i < nserver - 1; i++) {
+            struct conf_server *cs1, *cs2;
+
+            cs1 = array_get(&cp->server, i);
+            cs2 = array_get(&cp->server, i + 1);
+
+            if (string_compare(&cs1->name, &cs2->name) == 0) {
+                log_error("conf: pool '%.*s' has servers with same name '%.*s'",
+                          cp->name.len, cp->name.data, cs1->name.len, 
+                          cs1->name.data);
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            return NC_ERROR;
+        }
+		/* check for ms_mode */
+		if (cp->ms_mode) {
+			rstatus_t rs = conf_validate_server_ms_mode(cf, cp);
+			if (rs != NC_OK) {
+				return NC_ERROR;
+			}
+		}
+	    if (cp->read_mode) {
+	    	if (!cp->ms_mode) {
+	    		log_error("conf: read_mode only can be used when ms_mode is true");
+	    		return NC_ERROR;
+	    	}
+	    	switch (cp->read_mode) {
+	    		case CONF_READ_MODE_ALL:
+	    		case CONF_READ_MODE_MASTER_ONLY:
+	    		case CONF_READ_MODE_SLAVE_FIRST:
+	    			break;
+	    		default:
+	    		    log_error("conf: value of read_mode is invalid");
+	    		    return NC_ERROR;
+	    	}
+	    }
+
+        return NC_OK;
+    }
 }
 
 static rstatus_t
@@ -1210,8 +1427,7 @@ conf_validate_pool(struct conf *cf, struct conf_pool *cp)
     ASSERT(!string_empty(&cp->name));
 
     if (!cp->listen.valid) {
-        log_error("conf: directive \"listen:\" is missing");
-        return NC_ERROR;
+        log_warn("conf: directive \"listen:\" is missing");
     }
 
     /* set default values for unset directives */
@@ -1238,14 +1454,6 @@ conf_validate_pool(struct conf *cf, struct conf_pool *cp)
         cp->redis = CONF_DEFAULT_REDIS;
     }
 
-    if (cp->tcpkeepalive == CONF_UNSET_NUM) {
-        cp->tcpkeepalive = CONF_DEFAULT_TCPKEEPALIVE;
-    }
-
-    if (cp->redis_db == CONF_UNSET_NUM) {
-        cp->redis_db = CONF_DEFAULT_REDIS_DB;
-    }
-
     if (cp->preconnect == CONF_UNSET_NUM) {
         cp->preconnect = CONF_DEFAULT_PRECONNECT;
     }
@@ -1269,9 +1477,36 @@ conf_validate_pool(struct conf *cf, struct conf_pool *cp)
         cp->server_failure_limit = CONF_DEFAULT_SERVER_FAILURE_LIMIT;
     }
 
-    if (!cp->redis && cp->redis_auth.len > 0) {
-        log_error("conf: directive \"redis_auth:\" is only valid for a redis pool");
-        return NC_ERROR;
+    if (cp->server_failure_interval == CONF_UNSET_NUM) {
+        cp->server_failure_interval = CONF_DEFAULT_SERVER_FAILURE_INTERVAL;
+    }
+
+    if (cp->auto_probe_hosts == CONF_UNSET_NUM) {
+        cp->auto_probe_hosts = CONF_DEFAULT_AUTO_PROBE_HOSTS;
+    }
+    
+    if (cp->auto_warmup == CONF_UNSET_NUM) {
+        cp->auto_warmup = CONF_DEFAULT_AUTO_WARMUP;
+    }
+    
+    if (cp->virtual == CONF_UNSET_NUM) {
+        cp->virtual = CONF_DEFAULT_VIRTUAL;
+    }
+
+    if (cp->rate == CONF_UNSET_NUM) {
+        cp->rate = CONF_DEFAULT_RATE;
+    }
+
+    if (cp->burst == CONF_UNSET_NUM) {
+        cp->burst = CONF_DEFAULT_BURST;
+    }
+
+    if (cp->ms_mode == CONF_UNSET_NUM) {
+        cp->ms_mode = CONF_DEFAULT_MS_MODE;
+    }
+
+    if (cp->read_mode == CONF_UNSET_NUM) {
+        cp->read_mode = CONF_DEFAULT_READ_MODE;
     }
 
     status = conf_validate_server(cf, cp);
@@ -1318,6 +1553,10 @@ conf_post_validate(struct conf *cf)
         p1 = array_get(&cf->pool, i);
         p2 = array_get(&cf->pool, i + 1);
 
+        if (string_empty(&p1->listen.pname) || string_empty(&p2->listen.pname)) {
+            continue;
+        }
+        
         if (string_compare(&p1->listen.pname, &p2->listen.pname) == 0) {
             log_error("conf: pools '%.*s' and '%.*s' have the same listen "
                       "address '%.*s'", p1->name.len, p1->name.data,
@@ -1367,6 +1606,9 @@ conf_create(char *filename)
     /* validate configuration file before parsing */
     status = conf_pre_validate(cf);
     if (status != NC_OK) {
+        if (status == NC_EEMPTYCONF) {
+            goto done;
+        }
         goto error;
     }
 
@@ -1382,6 +1624,7 @@ conf_create(char *filename)
         goto error;
     }
 
+done:
     conf_dump(cf);
 
     fclose(cf->fh);
@@ -1390,8 +1633,6 @@ conf_create(char *filename)
     return cf;
 
 error:
-    log_stderr("nutcracker: configuration file '%s' syntax is invalid",
-               filename);
     fclose(cf->fh);
     cf->fh = NULL;
     conf_destroy(cf);
@@ -1462,32 +1703,8 @@ conf_set_listen(struct conf *cf, struct command *cmd, void *conf)
     }
 
     if (value->data[0] == '/') {
-        uint8_t *q, *start, *perm;
-        uint32_t permlen;
-
-
-        /* parse "socket_path permissions" from the end */
-        p = value->data + value->len -1;
-        start = value->data;
-        q = nc_strrchr(p, start, ' ');
-        if (q == NULL) {
-            /* no permissions field, so use defaults */
-            name = value->data;
-            namelen = value->len;
-        } else {
-            perm = q + 1;
-            permlen = (uint32_t)(p - perm + 1);
-
-            p = q - 1;
-            name = start;
-            namelen = (uint32_t)(p - start + 1);
-
-            errno = 0;
-            field->perm = (mode_t)strtol((char *)perm, NULL, 8);
-            if (errno || field->perm > 0777) {
-                return "has an invalid file permission in \"socket_path permission\" format string";
-            }
-        }
+        name = value->data;
+        namelen = value->len;
     } else {
         uint8_t *q, *start, *port;
         uint32_t portlen;
@@ -1530,141 +1747,83 @@ conf_set_listen(struct conf *cf, struct command *cmd, void *conf)
 }
 
 char *
-conf_add_server(struct conf *cf, struct command *cmd, void *conf)
+conf_add_downstream(struct conf *cf, struct command *cmd, void *conf)
 {
     rstatus_t status;
     struct array *a;
     struct string *value;
-    struct conf_server *field;
+    struct conf_downstream *field;
     uint8_t *p, *q, *start;
-    uint8_t *pname, *addr, *port, *weight, *name;
-    uint32_t k, delimlen, pnamelen, addrlen, portlen, weightlen, namelen;
-    char delim[] = " ::";
-
+    uint8_t *ns, *name;
+    uint32_t nslen, namelen;
+    
+    char delim = ' ';
+    
     p = conf;
     a = (struct array *)(p + cmd->offset);
-
+    
     field = array_push(a);
     if (field == NULL) {
         return CONF_ERROR;
     }
-
-    conf_server_init(field);
-
+    
+    conf_downstream_init(field);
+    
     value = array_top(&cf->arg);
-
-    /* parse "hostname:port:weight [name]" or "/path/unix_socket:weight [name]" from the end */
-    p = value->data + value->len - 1;
+    
+    p = value->data + value->len;
     start = value->data;
-    addr = NULL;
-    addrlen = 0;
-    weight = NULL;
-    weightlen = 0;
-    port = NULL;
-    portlen = 0;
-    name = NULL;
-    namelen = 0;
-
-    delimlen = value->data[0] == '/' ? 2 : 3;
-
-    for (k = 0; k < sizeof(delim); k++) {
-        q = nc_strrchr(p, start, delim[k]);
-        if (q == NULL) {
-            if (k == 0) {
-                /*
-                 * name in "hostname:port:weight [name]" format string is
-                 * optional
-                 */
-                continue;
-            }
-            break;
-        }
-
-        switch (k) {
-        case 0:
-            name = q + 1;
-            namelen = (uint32_t)(p - name + 1);
-            break;
-
-        case 1:
-            weight = q + 1;
-            weightlen = (uint32_t)(p - weight + 1);
-            break;
-
-        case 2:
-            port = q + 1;
-            portlen = (uint32_t)(p - port + 1);
-            break;
-
-        default:
-            NOT_REACHED();
-        }
-
-        p = q - 1;
+    
+    q = nc_strchr(start, p, delim);
+    if (q == NULL) {
+        array_pop(a);
+        return "has an invalid \"namespace pool_name\" format string";
     }
 
-    if (k != delimlen) {
-        return "has an invalid \"hostname:port:weight [name]\"or \"/path/unix_socket:weight [name]\" format string";
-    }
-
-    pname = value->data;
-    pnamelen = namelen > 0 ? value->len - (namelen + 1) : value->len;
-    status = string_copy(&field->pname, pname, pnamelen);
+    ns = start;
+    nslen = (uint32_t)(q - start);
+    status = string_copy(&field->ns, ns, nslen);
     if (status != NC_OK) {
         array_pop(a);
         return CONF_ERROR;
     }
 
-    addr = start;
-    addrlen = (uint32_t)(p - start + 1);
-
-    field->weight = nc_atoi(weight, weightlen);
-    if (field->weight < 0) {
-        return "has an invalid weight in \"hostname:port:weight [name]\" format string";
-    } else if (field->weight == 0) {
-        return "has a zero weight in \"hostname:port:weight [name]\" format string";
-    }
-
-    if (value->data[0] != '/') {
-        field->port = nc_atoi(port, portlen);
-        if (field->port < 0 || !nc_valid_port(field->port)) {
-            return "has an invalid port in \"hostname:port:weight [name]\" format string";
-        }
-    }
-
-    if (name == NULL) {
-        /*
-         * To maintain backward compatibility with libmemcached, we don't
-         * include the port as the part of the input string to the consistent
-         * hashing algorithm, when it is equal to 11211.
-         */
-        if (field->port == CONF_DEFAULT_KETAMA_PORT) {
-            name = addr;
-            namelen = addrlen;
-        } else {
-            name = addr;
-            namelen = addrlen + 1 + portlen;
-        }
-    }
-
+    name = q + 1;
+    namelen = (uint32_t)(p - name);
     status = string_copy(&field->name, name, namelen);
     if (status != NC_OK) {
+        array_pop(a);
         return CONF_ERROR;
     }
-
-    status = string_copy(&field->addrstr, addr, addrlen);
-    if (status != NC_OK) {
-        return CONF_ERROR;
-    }
-
-    /*
-     * The address resolution of the backend server hostname is lazy.
-     * The resolution occurs when a new connection to the server is
-     * created, which could either be the first time or every time
-     * the server gets re-added to the pool after an auto ejection
-     */
-
+    
     field->valid = 1;
+    return CONF_OK;
+}
+
+char *
+conf_add_string(struct conf *cf, struct command *cmd, void *conf)
+{
+    rstatus_t status;
+    struct array *a;
+    uint8_t *p;
+    struct string *field, *value;
+
+    p = conf;
+    a = (struct array *)(p + cmd->offset);
+    
+    field = array_push(a);
+    if (field == NULL) {
+        return CONF_ERROR;
+    }
+    string_init(field);
+    
+    value = array_top(&cf->arg);
+
+    status = string_duplicate(field, value);
+    if (status != NC_OK) {
+        array_pop(a);
+        return CONF_ERROR;
+    }
 
     return CONF_OK;
 }
@@ -1745,7 +1904,7 @@ conf_set_hash(struct conf *cf, struct command *cmd, void *conf)
             continue;
         }
 
-        *hp = hash - hash_strings;
+        *hp = (hash_type_t)(hash - hash_strings);
 
         return CONF_OK;
     }
@@ -1774,7 +1933,7 @@ conf_set_distribution(struct conf *cf, struct command *cmd, void *conf)
             continue;
         }
 
-        *dp = dist - dist_strings;
+        *dp = (dist_type_t)(dist - dist_strings);
 
         return CONF_OK;
     }

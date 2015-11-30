@@ -85,7 +85,6 @@ int nc_set_tcpnodelay(int sd);
 int nc_set_linger(int sd, int timeout);
 int nc_set_sndbuf(int sd, int size);
 int nc_set_rcvbuf(int sd, int size);
-int nc_set_tcpkeepalive(int sd);
 int nc_get_soerror(int sd);
 int nc_get_sndbuf(int sd);
 int nc_get_rcvbuf(int sd);
@@ -186,12 +185,12 @@ ssize_t _nc_recvn(int sd, void *vptr, size_t n);
 
 void nc_assert(const char *cond, const char *file, int line, int panic);
 void nc_stacktrace(int skip_count);
-void nc_stacktrace_fd(int fd);
 
 int _scnprintf(char *buf, size_t size, const char *fmt, ...);
 int _vscnprintf(char *buf, size_t size, const char *fmt, va_list args);
 int64_t nc_usec_now(void);
 int64_t nc_msec_now(void);
+struct timespec nc_millisec_to_timespec(int millisec);
 
 /*
  * Address resolution for internet (ipv4 and ipv6) and unix domain
@@ -212,5 +211,7 @@ int nc_resolve(struct string *name, int port, struct sockinfo *si);
 char *nc_unresolve_addr(struct sockaddr *addr, socklen_t addrlen);
 char *nc_unresolve_peer_desc(int sd);
 char *nc_unresolve_desc(int sd);
+
+char *nc_strerror(err_t err);
 
 #endif

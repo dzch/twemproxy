@@ -21,6 +21,8 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 
 #include <nc_core.h>
@@ -50,6 +52,8 @@ static struct stats_desc stats_server_desc[] = {
     STATS_SERVER_CODEC( DEFINE_ACTION )
 };
 #undef DEFINE_ACTION
+
+#define STATS_UNSET_NUMERIC -1
 
 void
 stats_describe(void)
@@ -85,6 +89,10 @@ stats_metric_init(struct stats_metric *stm)
 
     case STATS_TIMESTAMP:
         stm->value.timestamp = 0LL;
+        break;
+        
+    case STATS_NUMERIC:
+        stm->value.numeric = STATS_UNSET_NUMERIC;
         break;
 
     default:
@@ -194,7 +202,9 @@ stats_server_map(struct array *stats_server, struct array *server)
     uint32_t i, nserver;
 
     nserver = array_n(server);
-    ASSERT(nserver != 0);
+    if (nserver == 0) {
+        return NC_OK;
+    }
 
     status = array_init(stats_server, nserver, sizeof(struct stats_server));
     if (status != NC_OK) {
@@ -333,6 +343,7 @@ stats_create_buf(struct stats *st)
     uint32_t key_value_extra = 8;   /* "key": "value", */
     uint32_t pool_extra = 8;        /* '"pool_name": { ' + ' }' */
     uint32_t server_extra = 8;      /* '"server_name": { ' + ' }' */
+    uint32_t used_cpu_max_digits = 6; /* 100.00 */
     size_t size = 0;
     uint32_t i;
 
@@ -361,11 +372,19 @@ stats_create_buf(struct stats *st)
     size += int64_max_digits;
     size += key_value_extra;
 
-    size += st->ntotal_conn_str.len;
+    size += st->used_cpu_user_str.len;
+    size += used_cpu_max_digits;
+    size += key_value_extra;
+
+    size += st->used_cpu_sys_str.len;
+    size += used_cpu_max_digits;
+    size += key_value_extra;
+
+    size += st->voluntary_switches_str.len;
     size += int64_max_digits;
     size += key_value_extra;
 
-    size += st->ncurr_conn_str.len;
+    size += st->involuntary_switches_str.len;
     size += int64_max_digits;
     size += key_value_extra;
 
@@ -478,11 +497,34 @@ stats_add_num(struct stats *st, struct string *key, int64_t val)
 }
 
 static rstatus_t
+stats_add_float(struct stats *st, struct string *key, float val)
+{
+    struct stats_buffer *buf;
+    uint8_t *pos;
+    size_t room;
+    int n;
+
+    buf = &st->buf;
+    pos = buf->data + buf->len;
+    room = buf->size - buf->len - 1;
+
+    n = nc_snprintf(pos, room, "\"%.*s\":%.2f, ", key->len, key->data, val);
+    if (n < 0 || n >= (int)room) {
+        return NC_ERROR;
+    }
+
+    buf->len += (size_t)n;
+
+    return NC_OK;
+}
+
+static rstatus_t
 stats_add_header(struct stats *st)
 {
     rstatus_t status;
     struct stats_buffer *buf;
     int64_t cur_ts, uptime;
+    struct rusage ru;
 
     buf = &st->buf;
     buf->data[0] = '{';
@@ -490,6 +532,8 @@ stats_add_header(struct stats *st)
 
     cur_ts = (int64_t)time(NULL);
     uptime = cur_ts - st->start_ts;
+
+    getrusage(RUSAGE_SELF, &ru);
 
     status = stats_add_string(st, &st->service_str, &st->service);
     if (status != NC_OK) {
@@ -516,16 +560,26 @@ stats_add_header(struct stats *st)
         return status;
     }
 
-    status = stats_add_num(st, &st->ntotal_conn_str, conn_ntotal_conn());
+    status = stats_add_float(st, &st->used_cpu_user_str, (float)ru.ru_utime.tv_sec + (float)ru.ru_utime.tv_usec/100000);
     if (status != NC_OK) {
         return status;
     }
 
-    status = stats_add_num(st, &st->ncurr_conn_str, conn_ncurr_conn());
+    status = stats_add_float(st, &st->used_cpu_sys_str, (float)ru.ru_stime.tv_sec + (float)ru.ru_stime.tv_usec/1000000);
     if (status != NC_OK) {
         return status;
     }
 
+    status = stats_add_num(st, &st->voluntary_switches_str, ru.ru_nvcsw);
+    if (status != NC_OK) {
+        return status;
+    }
+
+    status = stats_add_num(st, &st->involuntary_switches_str, ru.ru_nivcsw);
+    if (status != NC_OK) {
+        return status;
+    }
+    
     return NC_OK;
 }
 
@@ -536,16 +590,30 @@ stats_add_footer(struct stats *st)
     uint8_t *pos;
 
     buf = &st->buf;
+    pos = buf->data + buf->len;
 
-    if (buf->len == buf->size) {
-        return NC_ERROR;
+    pos -= 2; /* go back by 2 bytes */
+
+    switch (pos[0]) {
+    case ',':
+        ASSERT(pos[1] == ' ');
+        pos[0] = '}';
+        pos[1] = '\n';
+        break;
+
+    case '}':
+        if (buf->len == buf->size) {
+            return NC_ERROR;
+        }
+        /* overwrite the last byte and add a new byte */
+        ASSERT(pos[1] == ',');
+        pos[1] = '}';
+        pos[2] = '\n';
+        buf->len += 1;
+        break;
+    default:
+        NOT_REACHED();
     }
-
-    /* overwrite the last byte and add a new byte */
-    pos = buf->data + buf->len - 1;
-    pos[0] = '}';
-    pos[1] = '\n';
-    buf->len += 1;
 
     return NC_OK;
 }
@@ -652,6 +720,12 @@ stats_aggregate_metric(struct array *dst, struct array *src)
         case STATS_TIMESTAMP:
             if (stm1->value.timestamp) {
                 stm2->value.timestamp = stm1->value.timestamp;
+            }
+            break;
+            
+        case STATS_NUMERIC:
+            if (stm1->value.numeric != STATS_UNSET_NUMERIC) {
+                stm2->value.numeric = stm1->value.numeric;
             }
             break;
 
@@ -787,27 +861,26 @@ stats_send_rsp(struct stats *st)
     return NC_OK;
 }
 
-static void
-stats_loop_callback(void *arg1, void *arg2)
-{
-    struct stats *st = arg1;
-    int n = *((int *)arg2);
-
-    /* aggregate stats from shadow (b) -> sum (c) */
-    stats_aggregate(st);
-
-    if (n == 0) {
-        return;
-    }
-
-    /* send aggregate stats sum (c) to collector */
-    stats_send_rsp(st);
-}
-
 static void *
 stats_loop(void *arg)
 {
-    event_loop_stats(stats_loop_callback, arg);
+    struct stats *st = arg;
+    int n;
+
+    for (;;) {
+        n = event_wait(st->st_evb, st->interval);
+
+        /* aggregate stats from shadow (b) -> sum (c) */
+        stats_aggregate(st);
+
+        if (n == 0) {
+            continue;
+        }
+
+        /* send aggregate stats sum (c) to collector */
+        stats_send_rsp(st);
+    }
+
     return NULL;
 }
 
@@ -867,9 +940,28 @@ stats_start_aggregator(struct stats *st)
         return status;
     }
 
+    st->st_evb = evbase_create(1, NULL);
+    if (st->st_evb == NULL) {
+        log_error("stats aggregator create failed: %s", strerror(errno));
+        return NC_ERROR;
+    }
+
+    ASSERT(st->st_evb != NULL);
+    ASSERT(st->sd >= 0);
+
+    status = event_add_st(st->st_evb, st->sd);
+    if (status < 0) {
+        log_error("stats aggregator create failed: %s", strerror(errno));
+        evbase_destroy(st->st_evb);
+        st->st_evb = NULL;
+        return NC_ERROR;
+    }
+
     status = pthread_create(&st->tid, NULL, stats_loop, st);
     if (status < 0) {
         log_error("stats aggregator create failed: %s", strerror(status));
+        evbase_destroy(st->st_evb);
+        st->st_evb = NULL;
         return NC_ERROR;
     }
 
@@ -884,6 +976,8 @@ stats_stop_aggregator(struct stats *st)
     }
 
     close(st->sd);
+    evbase_destroy(st->st_evb);
+    st->st_evb = NULL;
 }
 
 struct stats *
@@ -913,6 +1007,7 @@ stats_create(uint16_t stats_port, char *stats_ip, int stats_interval,
     array_null(&st->sum);
 
     st->tid = (pthread_t) -1;
+    st->st_evb = NULL;
     st->sd = -1;
 
     string_set_text(&st->service_str, "service");
@@ -927,9 +1022,11 @@ stats_create(uint16_t stats_port, char *stats_ip, int stats_interval,
     string_set_text(&st->uptime_str, "uptime");
     string_set_text(&st->timestamp_str, "timestamp");
 
-    string_set_text(&st->ntotal_conn_str, "total_connections");
-    string_set_text(&st->ncurr_conn_str, "curr_connections");
-
+    string_set_text(&st->used_cpu_user_str, "used_cpu_user");
+    string_set_text(&st->used_cpu_sys_str, "used_cpu_sys");
+    string_set_text(&st->voluntary_switches_str, "voluntary_switches");
+    string_set_text(&st->involuntary_switches_str, "involuntary_swithces");
+    
     st->updated = 0;
     st->aggregate = 0;
 
@@ -982,6 +1079,10 @@ void
 stats_swap(struct stats *st)
 {
     if (!stats_enabled) {
+        return;
+    }
+
+    if (st == NULL) {
         return;
     }
 
@@ -1096,18 +1197,18 @@ _stats_pool_decr_by(struct context *ctx, struct server_pool *pool,
 }
 
 void
-_stats_pool_set_ts(struct context *ctx, struct server_pool *pool,
-                   stats_pool_field_t fidx, int64_t val)
+_stats_pool_set(struct context *ctx, struct server_pool *pool,
+                  stats_pool_field_t fidx, int64_t val)
 {
     struct stats_metric *stm;
 
     stm = stats_pool_to_metric(ctx, pool, fidx);
+    
+    ASSERT(stm->type == STATS_NUMERIC);
+    stm->value.numeric = val;
 
-    ASSERT(stm->type == STATS_TIMESTAMP);
-    stm->value.timestamp = val;
-
-    log_debug(LOG_VVVERB, "set ts field '%.*s' to %"PRId64"", stm->name.len,
-              stm->name.data, stm->value.timestamp);
+    log_debug(LOG_VVVERB, "set field '%.*s' to %"PRId64"", stm->name.len,
+              stm->name.data, stm->value.numeric);
 }
 
 static struct stats_metric *
@@ -1197,16 +1298,16 @@ _stats_server_decr_by(struct context *ctx, struct server *server,
 }
 
 void
-_stats_server_set_ts(struct context *ctx, struct server *server,
-                     stats_server_field_t fidx, int64_t val)
+_stats_server_set(struct context *ctx, struct server *server,
+                  stats_server_field_t fidx, int64_t val)
 {
     struct stats_metric *stm;
 
     stm = stats_server_to_metric(ctx, server, fidx);
+    
+    ASSERT(stm->type == STATS_NUMERIC);
+    stm->value.numeric = val;
 
-    ASSERT(stm->type == STATS_TIMESTAMP);
-    stm->value.timestamp = val;
-
-    log_debug(LOG_VVVERB, "set ts field '%.*s' to %"PRId64"", stm->name.len,
-              stm->name.data, stm->value.timestamp);
+    log_debug(LOG_VVVERB, "set field '%.*s' to %"PRId64"", stm->name.len,
+              stm->name.data, stm->value.numeric);
 }

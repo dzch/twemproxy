@@ -20,6 +20,8 @@
 
 #include <nc_core.h>
 
+#define DEFAULT_STATS_NUM 64
+
 #ifdef NC_LITTLE_ENDIAN
 
 #define str4cmp(m, c0, c1, c2, c3)                                                          \
@@ -138,26 +140,45 @@
     (str15icmp(m, c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14) &&       \
      (m[15] == c15 || m[15] == (c15 ^ 0x20)))
 
+
+
+
 void memcache_parse_req(struct msg *r);
 void memcache_parse_rsp(struct msg *r);
-bool memcache_failure(struct msg *r);
+
+void memcache_pre_splitcopy(struct mbuf *mbuf, void *arg);
+rstatus_t memcache_post_splitcopy(struct msg *r);
+
 void memcache_pre_coalesce(struct msg *r);
 void memcache_post_coalesce(struct msg *r);
-rstatus_t memcache_add_auth(struct context *ctx, struct conn *c_conn, struct conn *s_conn);
-rstatus_t memcache_fragment(struct msg *r, uint32_t ncontinuum, struct msg_tqh *frag_msgq);
-rstatus_t memcache_reply(struct msg *r);
-void memcache_post_connect(struct context *ctx, struct conn *conn, struct server *server);
-void memcache_swallow_msg(struct conn *conn, struct msg *pmsg, struct msg *msg);
+
+rstatus_t memcache_pre_req_forward(struct context *, struct conn *, struct msg *);
+rstatus_t memcache_pre_rsp_forward(struct context *, struct conn *, struct msg *);
+
+rstatus_t memcache_build_probe(struct msg *r);
+
+struct memcache_stats *memcache_create_stats();
+void memcache_destroy_stats(struct memcache_stats *stats);
+
+struct conn *memcache_routing(struct context *ctx, struct server_pool *pool, struct msg *msg, struct string *key);
+rstatus_t memcache_post_routing(struct context *ctx, struct conn *conn, struct msg *msg);
 
 void redis_parse_req(struct msg *r);
 void redis_parse_rsp(struct msg *r);
-bool redis_failure(struct msg *r);
+
+void redis_pre_splitcopy(struct mbuf *mbuf, void *arg);
+rstatus_t redis_post_splitcopy(struct msg *r);
+
 void redis_pre_coalesce(struct msg *r);
 void redis_post_coalesce(struct msg *r);
-rstatus_t redis_add_auth(struct context *ctx, struct conn *c_conn, struct conn *s_conn);
-rstatus_t redis_fragment(struct msg *r, uint32_t ncontinuum, struct msg_tqh *frag_msgq);
-rstatus_t redis_reply(struct msg *r);
-void redis_post_connect(struct context *ctx, struct conn *conn, struct server *server);
-void redis_swallow_msg(struct conn *conn, struct msg *pmsg, struct msg *msg);
+
+rstatus_t redis_pre_rsp_forward(struct context *, struct conn *, struct msg *);
+
+rstatus_t redis_build_probe(struct msg *r);
+
+struct redis_stats *redis_create_stats();
+void redis_destroy_stats(struct redis_stats *stats);
+
+struct conn *redis_routing(struct context *ctx, struct server_pool *pool, struct msg *msg, struct string *key);
 
 #endif

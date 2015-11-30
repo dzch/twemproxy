@@ -20,69 +20,41 @@
 
 #include <nc_core.h>
 
-#define EVENT_SIZE  1024
+#define NC_EVENT_SIZE 1024
 
-#define EVENT_READ  0x0000ff
-#define EVENT_WRITE 0x00ff00
-#define EVENT_ERR   0xff0000
-
-typedef int (*event_cb_t)(void *, uint32_t);
-typedef void (*event_stats_cb_t)(void *, void *);
+#define EV_READ     0x0000ff
+#define EV_WRITE    0x00ff00
+#define EV_ERR      0xff0000
 
 #ifdef NC_HAVE_KQUEUE
-
-struct event_base {
-    int           kq;          /* kernel event queue descriptor */
-
-    struct kevent *change;     /* change[] - events we want to monitor */
-    int           nchange;     /* # change */
-
-    struct kevent *event;      /* event[] - events that were triggered */
-    int           nevent;      /* # event */
-    int           nreturned;   /* # event placed in event[] */
-    int           nprocessed;  /* # event processed from event[] */
-
-    event_cb_t    cb;          /* event callback */
+struct evbase {
+    int                  kq;
+    struct kevent        *changes;   /* list of changes to be made */
+    struct kevent        *kevents;   /* list of events returned from kevent */
+    int                  n_changes;  /* number of changes in our list */
+    int                  n_returned; /* number of events returned from kevent */
+    int                  n_processed;
+    int                  nevent;
+    void (*callback_fp)(void *, uint32_t);
 };
-
-#elif NC_HAVE_EPOLL
-
-struct event_base {
-    int                ep;      /* epoll descriptor */
-
-    struct epoll_event *event;  /* event[] - events that were triggered */
-    int                nevent;  /* # event */
-
-    event_cb_t         cb;      /* event callback */
+#endif
+#ifdef NC_HAVE_EPOLL
+struct evbase {
+    int                   ep;
+    int                   nevent;
+    struct epoll_event    *event;
+    void (*callback_fp)(void *, uint32_t);
 };
-
-#elif NC_HAVE_EVENT_PORTS
-
-#include <port.h>
-
-struct event_base {
-    int          evp;     /* event port descriptor */
-
-    port_event_t *event;  /* event[] - events that were triggered */
-    int          nevent;  /* # event */
-
-    event_cb_t   cb;      /* event callback */
-};
-
-#else
-# error missing scalable I/O event notification mechanism
 #endif
 
-struct event_base *event_base_create(int size, event_cb_t cb);
-void event_base_destroy(struct event_base *evb);
+struct evbase *evbase_create(int size, void (*callback_fp)(void *, uint32_t));
+void evbase_destroy(struct evbase *evb);
 
-int event_add_in(struct event_base *evb, struct conn *c);
-int event_del_in(struct event_base *evb, struct conn *c);
-int event_add_out(struct event_base *evb, struct conn *c);
-int event_del_out(struct event_base *evb, struct conn *c);
-int event_add_conn(struct event_base *evb, struct conn *c);
-int event_del_conn(struct event_base *evb, struct conn *c);
-int event_wait(struct event_base *evb, int timeout);
-void event_loop_stats(event_stats_cb_t cb, void *arg);
+int event_add_out(struct evbase *evb, struct conn *c);
+int event_del_out(struct evbase *evb, struct conn *c);
+int event_add_conn(struct evbase *evb, struct conn *c);
+int event_del_conn(struct evbase *evb, struct conn *c);
+int event_wait(struct evbase *evb, int timeout);
+int event_add_st(struct evbase *evb, int fd);
 
 #endif /* _NC_EVENT_H */

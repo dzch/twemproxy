@@ -89,7 +89,7 @@ rsp_recv_next(struct context *ctx, struct conn *conn, bool alloc)
     struct msg *msg;
 
     ASSERT(!conn->client && !conn->proxy);
-
+ 
     if (conn->eof) {
         msg = conn->rmsg;
 
@@ -158,53 +158,19 @@ rsp_filter(struct context *ctx, struct conn *conn, struct msg *msg)
         log_debug(LOG_ERR, "filter stray rsp %"PRIu64" len %"PRIu32" on s %d",
                   msg->id, msg->mlen, conn->sd);
         rsp_put(msg);
-
-        /*
-         * Memcached server can respond with an error response before it has
-         * received the entire request. This is most commonly seen for set
-         * requests that exceed item_size_max. IMO, this behavior of memcached
-         * is incorrect. The right behavior for update requests that are over
-         * item_size_max would be to either:
-         * - close the connection Or,
-         * - read the entire item_size_max data and then send CLIENT_ERROR
-         *
-         * We handle this stray packet scenario in nutcracker by closing the
-         * server connection which would end up sending SERVER_ERROR to all
-         * clients that have requests pending on this server connection. The
-         * fix is aggressive, but not doing so would lead to clients getting
-         * out of sync with the server and as a result clients end up getting
-         * responses that don't correspond to the right request.
-         *
-         * See: https://github.com/twitter/twemproxy/issues/149
-         */
-        conn->err = EINVAL;
-        conn->done = 1;
         return true;
     }
     ASSERT(pmsg->peer == NULL);
     ASSERT(pmsg->request && !pmsg->done);
 
-    /*
-     * If the response from a server suggests a protocol level transient
-     * failure, close the server connection and send back a generic error
-     * response to the client.
-     *
-     * If auto_eject_host is enabled, this will also update the failure_count
-     * and eject the server if it exceeds the failure_limit
-     */
-    if (msg->failure(msg)) {
-        log_debug(LOG_INFO, "server failure rsp %"PRIu64" len %"PRIu32" "
-                  "type %d on s %d", msg->id, msg->mlen, msg->type, conn->sd);
-        rsp_put(msg);
-
-        conn->err = EINVAL;
-        conn->done = 1;
-
-        return true;
-    }
+    /* establish msg <-> pmsg (response <-> request) link */
+    msg->peer = pmsg;
+    pmsg->peer = msg;
 
     if (pmsg->swallow) {
-        conn->swallow_msg(conn, pmsg, msg);
+        if (pmsg->pre_swallow != NULL) {
+            pmsg->pre_swallow(ctx, conn, msg);
+        }
 
         conn->dequeue_outq(ctx, conn, pmsg);
         pmsg->done = 1;
@@ -213,7 +179,6 @@ rsp_filter(struct context *ctx, struct conn *conn, struct msg *msg)
                   "%"PRIu64" on s %d", msg->id, msg->mlen, pmsg->id,
                   conn->sd);
 
-        rsp_put(msg);
         req_put(pmsg);
         return true;
     }
@@ -222,12 +187,12 @@ rsp_filter(struct context *ctx, struct conn *conn, struct msg *msg)
 }
 
 static void
-rsp_forward_stats(struct context *ctx, struct server *server, struct msg *msg, uint32_t msgsize)
+rsp_forward_stats(struct context *ctx, struct server *server, struct msg *msg)
 {
     ASSERT(!msg->request);
 
     stats_server_incr(ctx, server, responses);
-    stats_server_incr_by(ctx, server, response_bytes, msgsize);
+    stats_server_incr_by(ctx, server, response_bytes, msg->mlen);
 }
 
 static void
@@ -236,28 +201,28 @@ rsp_forward(struct context *ctx, struct conn *s_conn, struct msg *msg)
     rstatus_t status;
     struct msg *pmsg;
     struct conn *c_conn;
-    uint32_t msgsize;
 
     ASSERT(!s_conn->client && !s_conn->proxy);
-    msgsize = msg->mlen;
 
     /* response from server implies that server is ok and heartbeating */
     server_ok(ctx, s_conn);
 
-    /* dequeue peer message (request) from server */
-    pmsg = TAILQ_FIRST(&s_conn->omsg_q);
-    ASSERT(pmsg != NULL && pmsg->peer == NULL);
-    ASSERT(pmsg->request && !pmsg->done);
+    /*
+     * msg <-> pmsg (response <-> request) link has been established
+     * in rsp_filter
+     */
+    pmsg = msg->peer;
 
     s_conn->dequeue_outq(ctx, s_conn, pmsg);
     pmsg->done = 1;
 
-    /* establish msg <-> pmsg (response <-> request) link */
-    pmsg->peer = msg;
-    msg->peer = pmsg;
-
     msg->pre_coalesce(msg);
 
+    if (msg->pre_rsp_forward != NULL &&
+        msg->pre_rsp_forward(ctx, s_conn, msg) != NC_OK) {
+        return;
+    }
+    
     c_conn = pmsg->owner;
     ASSERT(c_conn->client && !c_conn->proxy);
 
@@ -267,8 +232,8 @@ rsp_forward(struct context *ctx, struct conn *s_conn, struct msg *msg)
             c_conn->err = errno;
         }
     }
-
-    rsp_forward_stats(ctx, s_conn->owner, msg, msgsize);
+    
+    rsp_forward_stats(ctx, s_conn->owner, msg);
 }
 
 void

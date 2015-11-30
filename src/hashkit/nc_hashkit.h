@@ -21,6 +21,8 @@
 #include <nc_core.h>
 #include <nc_server.h>
 
+#define DIST_RANGE_MAX (1<<16)
+
 #define HASH_CODEC(ACTION)                      \
     ACTION( HASH_ONE_AT_A_TIME, one_at_a_time ) \
     ACTION( HASH_MD5,           md5           ) \
@@ -33,12 +35,15 @@
     ACTION( HASH_FNV1A_32,      fnv1a_32      ) \
     ACTION( HASH_HSIEH,         hsieh         ) \
     ACTION( HASH_MURMUR,        murmur        ) \
+    ACTION( HASH_MURMUR_64,     murmur_64     ) \
     ACTION( HASH_JENKINS,       jenkins       ) \
 
 #define DIST_CODEC(ACTION)                      \
     ACTION( DIST_KETAMA,        ketama        ) \
     ACTION( DIST_MODULA,        modula        ) \
     ACTION( DIST_RANDOM,        random        ) \
+    ACTION( DIST_RANGE,         range         ) \
+    
 
 #define DEFINE_ACTION(_hash, _name) _hash,
 typedef enum hash_type {
@@ -67,12 +72,17 @@ uint32_t hash_fnv1a_32(const char *key, size_t key_length);
 uint32_t hash_hsieh(const char *key, size_t key_length);
 uint32_t hash_jenkins(const char *key, size_t length);
 uint32_t hash_murmur(const char *key, size_t length);
+uint32_t hash_murmur_64(const char *key, size_t length);
+
 
 rstatus_t ketama_update(struct server_pool *pool);
-uint32_t ketama_dispatch(struct continuum *continuum, uint32_t ncontinuum, uint32_t hash);
+int ketama_dispatch(struct server_pool *pool, struct continuum *continuum, uint32_t ncontinuum, uint32_t hash);
 rstatus_t modula_update(struct server_pool *pool);
-uint32_t modula_dispatch(struct continuum *continuum, uint32_t ncontinuum, uint32_t hash);
+int modula_dispatch(struct server_pool *pool, struct continuum *continuum, uint32_t ncontinuum, uint32_t hash);
 rstatus_t random_update(struct server_pool *pool);
-uint32_t random_dispatch(struct continuum *continuum, uint32_t ncontinuum, uint32_t hash);
+int random_dispatch(struct server_pool *pool, struct continuum *continuum, uint32_t ncontinuum, uint32_t hash);
+rstatus_t range_update(struct server_pool *pool);
+int range_dispatch(struct server_pool *pool, struct continuum *continuum, uint32_t ncontinuum, uint32_t hash, int op_write);
+
 
 #endif

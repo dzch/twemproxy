@@ -23,6 +23,10 @@
 #include <fcntl.h>
 #include <netdb.h>
 
+#ifdef NC_HAVE_BACKTRACE
+#include <execinfo.h>
+#endif
+
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -32,10 +36,6 @@
 #include <netinet/tcp.h>
 
 #include <nc_core.h>
-
-#ifdef NC_HAVE_BACKTRACE
-# include <execinfo.h>
-#endif
 
 int
 nc_set_blocking(int sd)
@@ -107,13 +107,6 @@ nc_set_linger(int sd, int timeout)
     len = sizeof(linger);
 
     return setsockopt(sd, SOL_SOCKET, SO_LINGER, &linger, len);
-}
-
-int
-nc_set_tcpkeepalive(int sd)
-{
-    int val = 1;
-    return setsockopt(sd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
 }
 
 int
@@ -307,18 +300,6 @@ nc_stacktrace(int skip_count)
 }
 
 void
-nc_stacktrace_fd(int fd)
-{
-#ifdef NC_HAVE_BACKTRACE
-    void *stack[64];
-    int size;
-
-    size = backtrace(stack, 64);
-    backtrace_symbols_fd(stack, size, fd);
-#endif
-}
-
-void
 nc_assert(const char *cond, const char *file, int line, int panic)
 {
     log_error("assert '%s' failed @ (%s, %d)", cond, file, line);
@@ -496,12 +477,8 @@ nc_resolve_inet(struct string *name, int port, struct sockinfo *si)
 
     nc_snprintf(service, NC_UINTMAX_MAXLEN, "%d", port);
 
-    /*
-     * getaddrinfo() returns zero on success or one of the error codes listed
-     * in gai_strerror(3) if an error occurs
-     */
     status = getaddrinfo(node, service, &hints, &ai);
-    if (status != 0) {
+    if (status < 0) {
         log_error("address resolution of node '%s' service '%s' failed: %s",
                   node, service, gai_strerror(status));
         return -1;
@@ -644,4 +621,36 @@ nc_unresolve_desc(int sd)
     }
 
     return nc_unresolve_addr(addr, addrlen);
+}
+
+struct timespec
+nc_millisec_to_timespec (int n_millisec)
+{
+    struct timeval tv = {n_millisec/1000LL, (n_millisec%1000LL)*1000LL};
+    struct timespec ts;
+
+    TIMEVAL_TO_TIMESPEC(&tv, &ts);         
+
+    return ts;
+}
+
+static char *
+_nc_strerror(err_t err)
+{
+    switch (err) {
+    case NC_OK:
+        return "Ok";
+    case NC_ETOOMANYREQUESTS:
+        return "Too Many Requests";
+    case NC_ESERVICEUNAVAILABLE:
+        return "Service Unavailable";
+    default:
+        return "Unkown";
+    }
+}
+
+char *
+nc_strerror(err_t err)
+{
+    return err >= 0 ? strerror(err) : _nc_strerror(err);
 }

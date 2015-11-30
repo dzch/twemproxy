@@ -218,7 +218,11 @@ rbtree_delete(struct rbtree *tree, struct rbnode *node)
         subst = node;
     } else {
         subst = rbtree_node_min(node->right, sentinel);
-        temp = subst->right;
+        if (subst->left != sentinel) {
+            temp = subst->left;
+        } else {
+            temp = subst->right;
+        }
     }
 
     if (subst == *root) {
