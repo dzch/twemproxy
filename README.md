@@ -6,18 +6,6 @@ This is a modified version for test and some other usage.
 
 ## Build
 
-To build nutcracker from [distribution tarball](http://code.google.com/p/twemproxy/downloads/list):
-
-    $ ./configure
-    $ make
-    $ sudo make install
-
-To build nutcracker from [distribution tarball](http://code.google.com/p/twemproxy/downloads/list) in _debug mode_:
-
-    $ CFLAGS="-ggdb3 -O0" ./configure --enable-debug=full
-    $ make
-    $ sudo make install
-
 To build nutcracker from source with _debug logs enabled_ and _assertions disabled_:
 
     $ git clone git@github.com:twitter/twemproxy.git
