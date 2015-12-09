@@ -8,7 +8,7 @@
 
 To build nutcracker from source with _debug logs enabled_ and _assertions disabled_:
 
-    $ git clone git@github.com:twitter/twemproxy.git
+    $ git clone git@github.com:dzch/twemproxy.git
     $ cd twemproxy
     $ autoreconf -fvi
     $ ./configure --enable-debug=log
