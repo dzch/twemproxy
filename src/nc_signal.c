@@ -26,6 +26,7 @@ static struct signal signals[] = {
     { SIGUSR2, "SIGUSR2", 0,                 signal_handler },
     { SIGTTIN, "SIGTTIN", 0,                 signal_handler },
     { SIGTTOU, "SIGTTOU", 0,                 signal_handler },
+    { SIGTERM, "SIGTERM", 0,                 signal_handler },
     { SIGHUP,  "SIGHUP",  0,                 signal_handler },
     { SIGINT,  "SIGINT",  0,                 signal_handler },
     { SIGSEGV, "SIGSEGV", (int)SA_RESETHAND, signal_handler },
@@ -70,6 +71,7 @@ signal_handler(int signo)
     void (*action)(void);
     char *actionstr;
     bool done;
+	bool terminated;
 
     for (sig = signals; sig->signo != 0; sig++) {
         if (sig->signo == signo) {
@@ -81,6 +83,8 @@ signal_handler(int signo)
     actionstr = "";
     action = NULL;
     done = false;
+	terminated = false;
+
 
     switch (signo) {
     case SIGUSR1:
@@ -97,6 +101,11 @@ signal_handler(int signo)
     case SIGTTOU:
         actionstr = ", down logging level";
         action = log_level_down;
+        break;
+
+    case SIGTERM:
+        actionstr = ", exiting with status code 0";
+		terminated = true;
         break;
 
     case SIGHUP:
@@ -128,4 +137,8 @@ signal_handler(int signo)
     if (done) {
         exit(1);
     }
+
+	if (terminated) {
+		exit(0);
+	}
 }
